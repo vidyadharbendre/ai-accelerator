@@ -1,19 +1,19 @@
 # RAG Implementation with LlamaIndex and LanceDB
 
-This notebook demonstrates a complete RAG (Retrieval Augmented Generation) implementation using LlamaIndex and LanceDB. We'll explore three different approaches:
+# This notebook demonstrates a complete RAG (Retrieval Augmented Generation) implementation using LlamaIndex and LanceDB. We'll explore three different approaches:
 
-1. **Vector Search Only** - Fast retrieval without LLM generation
-2. **HuggingFace API Integration** - Cloud-based LLM with authentication
-3. **Local LLM with Ollama** - Complete local solution
+# 1. **Vector Search Only** - Fast retrieval without LLM generation
+# 2. **HuggingFace API Integration** - Cloud-based LLM with authentication
+# 3. **Local LLM with Ollama** - Complete local solution
 
-## Overview
+# ## Overview
 
-The notebook covers:
-- Data loading and preparation from HuggingFace datasets
-- Vector store setup with LanceDB
-- Embedding generation with HuggingFace models
-- Three different query approaches with increasing complexity
-- Utility functions for table exploration and optimization
+# The notebook covers:
+# - Data loading and preparation from HuggingFace datasets
+# - Vector store setup with LanceDB
+# - Embedding generation with HuggingFace models
+# - Three different query approaches with increasing complexity
+# - Utility functions for table exploration and optimization
 ## 1. Install Required Dependencies
 # # Install all required packages
 # !pip install llama-index llama-index-vector-stores-lancedb llama-index-embeddings-huggingface llama-index-llms-huggingface-api lancedb datasets -q
@@ -135,22 +135,77 @@ async def create_and_populate_index(documents, db, table_name):
     return vector_store, embed_model
 
 # Create embeddings and populate vector store
-vector_store, embed_model = await create_and_populate_index(documents, db, table_name)
+#vector_store, embed_model = await create_and_populate_index(documents, db, table_name)
+
+
+
+# 2. Define test_vector_search BEFORE main()
+def test_vector_search(db, table_name, embed_model):
+    print("Testing Vector Search (No LLM needed)")
+    print("=" * 50)
+    
+    queries = [
+        "technology and artificial intelligence expert",
+        "teacher educator professor",
+        "environment climate sustainability", 
+        "art culture heritage creative"
+    ]
+    
+    table = db.open_table(table_name)
+    for query in queries:
+        print(f"\nQuery: {query}")
+        print("-" * 30)
+        results = perform_vector_search(db, table_name, query, embed_model, top_k=3)
+        for idx, row in results.iterrows():
+            score = row.get('_distance', 'N/A')
+            text = row.get('text', 'N/A')
+            score_str = f"{score:.3f}" if isinstance(score, (int, float)) else str(score)
+            print(f"\nResult {idx+1} (Score: {score_str}): {text[:200]}...")
+
+# 3. Orchestration
+async def main():
+    documents = prepare_data(num_samples=100)
+    db, table_name = setup_lancedb_store()
+    vector_store, embed_model = await create_and_populate_index(documents, db, table_name)
+    test_vector_search(db, table_name, embed_model)
+
+if __name__ == "__main__":
+    import asyncio
+    asyncio.run(main())
+
+
+
+
+
+
 ## 6. Option 1: Vector Search Only (No LLM)
 
-This approach provides fast document retrieval without LLM generation. Perfect for finding relevant content quickly.
+#This approach provides fast document retrieval without LLM generation. Perfect for finding relevant content quickly.
+# def perform_vector_search(db, table_name, query_text, embed_model, top_k=5):
+#     """
+#     Perform direct vector search on LanceDB
+#     """
+#     # Get query embedding
+#     query_embedding = embed_model.get_text_embedding(query_text)
+    
+#     # Open table and perform search
+#     table = db.open_table(table_name)
+#     results = table.search(query_embedding).limit(top_k).to_pandas()
+    
+#     return results
 def perform_vector_search(db, table_name, query_text, embed_model, top_k=5):
-    """
-    Perform direct vector search on LanceDB
-    """
-    # Get query embedding
     query_embedding = embed_model.get_text_embedding(query_text)
-    
-    # Open table and perform search
     table = db.open_table(table_name)
-    results = table.search(query_embedding).limit(top_k).to_pandas()
-    
-    return results
+
+    df = table.search(query_embedding).limit(top_k*2).to_pandas()
+
+    # Handle missing persona_id gracefully
+    if "persona_id" in df.columns:
+        df = df.drop_duplicates(subset=["persona_id"])
+    elif "metadata.persona_id" in df.columns:
+        df = df.drop_duplicates(subset=["metadata.persona_id"])
+
+    return df.head(top_k)
 
 def test_vector_search():
     """
@@ -191,7 +246,7 @@ def test_vector_search():
 test_vector_search()
 ## 7. Option 2: RAG with HuggingFace API
 
-This approach uses HuggingFace's cloud API for LLM generation. Requires API token authentication.
+#This approach uses HuggingFace's cloud API for LLM generation. Requires API token authentication.
 # Set your HuggingFace API token here
 # Get your free token from: https://huggingface.co/settings/tokens
 os.environ["HUGGINGFACE_API_KEY"] = "your_token_here"  # Replace with your actual token
@@ -268,7 +323,7 @@ async def test_huggingface_rag():
 # await test_huggingface_rag()
 ## 8. Option 3: RAG with Local LLM (Ollama)
 
-This approach uses a completely local LLM setup. No internet required after initial setup.
+#This approach uses a completely local LLM setup. No internet required after initial setup.
 def check_ollama_installed():
     """Check if Ollama is installed"""
     try:
@@ -505,23 +560,23 @@ def show_usage_examples():
 show_usage_examples()
 ## Summary
 
-This notebook provides three complete RAG implementation approaches:
+#This notebook provides three complete RAG implementation approaches:
 
 ### Option 1: Vector Search Only
-- **Best for**: Fast document retrieval, no generation needed
-- **Advantages**: Very fast, no API costs, no setup complexity
-- **Use case**: Finding relevant documents, initial exploration
+# - **Best for**: Fast document retrieval, no generation needed
+# - **Advantages**: Very fast, no API costs, no setup complexity
+# - **Use case**: Finding relevant documents, initial exploration
 
 ### Option 2: HuggingFace API
-- **Best for**: High-quality responses with cloud LLMs
-- **Advantages**: Latest models, no local resources needed
-- **Requirements**: HuggingFace API token
-- **Use case**: Production applications with budget for API calls
+# - **Best for**: High-quality responses with cloud LLMs
+# - **Advantages**: Latest models, no local resources needed
+# - **Requirements**: HuggingFace API token
+# - **Use case**: Production applications with budget for API calls
 
 ### Option 3: Local LLM (Ollama)
-- **Best for**: Complete privacy, no internet dependency
-- **Advantages**: No API costs, full control, offline capability
-- **Requirements**: Ollama installation, local compute resources
-- **Use case**: Private data, cost-sensitive applications
+# - **Best for**: Complete privacy, no internet dependency
+# - **Advantages**: No API costs, full control, offline capability
+# - **Requirements**: Ollama installation, local compute resources
+# - **Use case**: Private data, cost-sensitive applications
 
-Choose the approach that best fits your needs!
+# Choose the approach that best fits your needs!
