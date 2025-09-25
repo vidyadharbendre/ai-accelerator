@@ -176,10 +176,15 @@ A simple but functional RAG web interface where users can:
 - Get clear status messages
 
 <<<<<<< HEAD
+<<<<<<< HEAD
 <img width="1882" height="979" alt="Screenshot 2025-09-21 at 9 11 55 AM" src="https://github.com/user-attachments/assets/0ecc56d4-8dc1-435a-b2e5-ef2f003bcbaa" />
 
 =======
 >>>>>>> c0c557c (:sparkles: [Day_6/assignments] Add RAG Assignments and README)
+=======
+<img width="1882" height="979" alt="Screenshot 2025-09-21 at 9 11 55 AM" src="https://github.com/user-attachments/assets/0ecc56d4-8dc1-435a-b2e5-ef2f003bcbaa" />
+
+>>>>>>> 3390575 (:memo: [Day_6/assignments/README] Add Gradio App Images")
 ---
 
 ## Assignment 3b: Advanced Gradio RAG Frontend
@@ -240,11 +245,17 @@ A professional RAG interface with:
 - Ability to experiment with different RAG approaches
 
 <<<<<<< HEAD
+<<<<<<< HEAD
 <img width="1804" height="983" alt="Screenshot 2025-09-21 at 9 39 22 AM" src="https://github.com/user-attachments/assets/37a6cbb4-baed-480e-a355-8c3cba1ad38b" />
 
 
 =======
 >>>>>>> c0c557c (:sparkles: [Day_6/assignments] Add RAG Assignments and README)
+=======
+<img width="1804" height="983" alt="Screenshot 2025-09-21 at 9 39 22 AM" src="https://github.com/user-attachments/assets/37a6cbb4-baed-480e-a355-8c3cba1ad38b" />
+
+
+>>>>>>> 3390575 (:memo: [Day_6/assignments/README] Add Gradio App Images")
 ### Key Benefits
 - **Parameter Understanding**: Learn how different settings affect RAG performance
 - **Production Patterns**: Build interfaces suitable for real applications
