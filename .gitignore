@@ -226,7 +226,11 @@ marimo/_lsp/
 __marimo__/
 
 
+<<<<<<< HEAD
 #google cloud sdk
+=======
+# Google Cloud SDK
+>>>>>>> main
 google-cloud-cli-darwin-arm.tar.gz
 google-cloud-sdk/
 

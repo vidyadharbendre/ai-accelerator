@@ -1,0 +1,8 @@
+{
+  "cline.provider": "custom",
+  "cline.apiBaseUrl": "http://localhost:11434/v1",
+  "cline.apiKey": "none",
+  "cline.model": "llama3:latest",   // must match Ollama tag
+  "cline.maxTokens": 2048,
+  "cline.temperature": 0.7
+}
