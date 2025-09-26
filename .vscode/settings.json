@@ -4,5 +4,7 @@
   "cline.apiKey": "none",
   "cline.model": "llama3:latest",   // must match Ollama tag
   "cline.maxTokens": 2048,
-  "cline.temperature": 0.7
+  "cline.temperature": 0.7,
+  "editor.lineNumbers": "on"
+
 }
