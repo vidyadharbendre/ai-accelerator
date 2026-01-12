@@ -25,6 +25,12 @@ import requests
 import langsmith
 from dotenv import load_dotenv
 
+# SECURITY: Constants for configuration
+MAX_INPUT_SIZE = 10_000_000  # 10MB limit for code input
+MAX_JSON_PARSE_SIZE = 1_000_000  # 1MB limit for JSON parsing
+MAX_REGEX_EXECUTION_TIME = 5.0  # 5 second timeout for regex operations
+SAFE_BASE_URL = "https://openrouter.ai/api/v1"  # Centralized base URL
+
 # Global variables for Langsmith
 _langsmith_initialized = False
 _langsmith_client = None
@@ -524,7 +530,7 @@ class OpenRouterLangChainReviewer:
                 model=model_id,
                 temperature=temperature,
                 api_key=api_key,
-                base_url="https://openrouter.ai/api/v1",
+                base_url=SAFE_BASE_URL,
                 model_kwargs={
                     "extra_headers": {
                         "HTTP-Referer": "https://streamlit-langchain-code-review.com",
@@ -557,10 +563,18 @@ class OpenRouterLangChainReviewer:
         """Comprehensive code analysis using LangChain chains"""
         if not self.llm:
             raise ValueError("No model configured")
-        
+
+        # SECURITY: Input validation and size limits
+        if not isinstance(code, str):
+            raise TypeError("Code input must be a string")
+        if len(code) > MAX_INPUT_SIZE:
+            raise ValueError(f"Code input too large: {len(code)} bytes (max {MAX_INPUT_SIZE})")
+        if len(code.strip()) == 0:
+            raise ValueError("Code input cannot be empty")
+
         # Ensure Langsmith is initialized
         langsmith_client = get_langsmith_client()
-        
+
         start_time = datetime.now()
         try:
             validated_language = _require_supported_language(language)
@@ -1388,10 +1402,11 @@ Your response must be ONLY the JSON array, nothing else."""
         logger.info(f"Parsing response: '{cleaned_result[:200]}...'")
 
         # Strategy 1: Extract JSON from markdown code blocks (most common case)
-        # Use safer patterns to prevent ReDoS - avoid nested quantifiers and backtracking
+        # SECURITY: Use safer patterns to prevent ReDoS - avoid nested quantifiers and backtracking
+        # Simple pattern to find JSON blocks without complex nesting
         markdown_json_patterns = [
-            r'```json\s*\n?\[\s*(?:\{[^}]*\}[,\s]*)*\]\s*\n?```',  # JSON in ```json blocks, structured
-            r'```\s*\n?\[\s*(?:\{[^}]*\}[,\s]*)*\]\s*\n?```',      # JSON in generic ``` blocks, structured
+            r'```json\s*\n?\[.*?\]\s*\n?```',  # JSON in ```json blocks
+            r'```\s*\n?\[.*?\]\s*\n?```',      # JSON in generic ``` blocks
         ]
 
         for pattern in markdown_json_patterns:
