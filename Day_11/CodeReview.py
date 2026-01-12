@@ -580,12 +580,15 @@ class OpenRouterLangChainReviewer:
                 logger.info(f"Sending to model - Language: {language}, Code length: {len(code)} chars")
 
                 # SECURITY: Sanitize inputs to prevent injection attacks
-                # Use string formatting instead of direct interpolation for safety
-                analysis_prompt_text = """You are a code security auditor. Analyze this {language} code VERY CAREFULLY for ANY issues.
+                # Use safer string formatting and limit input sizes
+                safe_language = validated_language.replace('`', '').replace('{', '').replace('}', '')[:50]
+                safe_code = prompt_code[:30000]  # Limit code size in prompt
+
+                analysis_prompt_text = f"""You are a code security auditor. Analyze this {safe_language} code VERY CAREFULLY for ANY issues.
 
 CODE TO ANALYZE:
-```{language}
-{code}
+```{safe_language}
+{safe_code}
 ```
 
 You MUST return ONLY a valid JSON array. Find issues in this code if they exist.
@@ -617,7 +620,7 @@ CRITICAL: Look for these specific issues:
 
 BE SPECIFIC: Reference actual line numbers and quote problematic code.
 Return [] if no issues found.
-Your response must be ONLY the JSON array, nothing else.""".format(language=validated_language, code=prompt_code)
+Your response must be ONLY the JSON array, nothing else."""
 
                 # Use the LLM directly with the constructed prompt
                 messages = [
@@ -1385,10 +1388,10 @@ Your response must be ONLY the JSON array, nothing else.""".format(language=vali
         logger.info(f"Parsing response: '{cleaned_result[:200]}...'")
 
         # Strategy 1: Extract JSON from markdown code blocks (most common case)
-        # Use safer, more specific patterns to prevent ReDoS
+        # Use safer patterns to prevent ReDoS - avoid nested quantifiers and backtracking
         markdown_json_patterns = [
-            r'```json\s*\n?(\[.*?\])\s*\n?```',  # JSON in ```json blocks
-            r'```\s*\n?(\[.*?\])\s*\n?```',      # JSON in generic ``` blocks
+            r'```json\s*\n?\[\s*(?:\{[^}]*\}[,\s]*)*\]\s*\n?```',  # JSON in ```json blocks, structured
+            r'```\s*\n?\[\s*(?:\{[^}]*\}[,\s]*)*\]\s*\n?```',      # JSON in generic ``` blocks, structured
         ]
 
         for pattern in markdown_json_patterns:
