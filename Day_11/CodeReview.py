@@ -1399,44 +1399,65 @@ Your response must be ONLY the JSON array, nothing else."""
             logger.warning("Potentially malicious content detected in LLM response, rejecting")
             return []
 
-        logger.info(f"Parsing response: '{cleaned_result[:200]}...'")
+        logger.info(f"Parsing response length: {len(cleaned_result)} chars")
+        logger.debug(f"Parsing response preview: '{cleaned_result[:300]}...'")
 
         # Strategy 1: Extract JSON from markdown code blocks (most common case)
-        # SECURITY: Use safer patterns to prevent ReDoS - avoid nested quantifiers and backtracking
-        # Simple pattern to find JSON blocks without complex nesting
+        # IMPROVED: Use more robust patterns that handle nested structures and escape control chars
         markdown_json_patterns = [
-            r'```json\s*\n?\[.*?\]\s*\n?```',  # JSON in ```json blocks
-            r'```\s*\n?\[.*?\]\s*\n?```',      # JSON in generic ``` blocks
+            r'```json\s*\n?(\[[\s\S]*?\])\s*\n?```',  # JSON in ```json blocks - handles nested
+            r'```\s*\n?(\[[\s\S]*?\])\s*\n?```',      # JSON in generic ``` blocks - handles nested
+            r'```\w*\s*\n?(\[[\s\S]*?\])\s*\n?```',   # Any code block with JSON array
         ]
 
         for pattern in markdown_json_patterns:
             try:
                 # Use re.search instead of re.findall for better performance
-                match = re.search(pattern, cleaned_result, re.DOTALL)
+                match = re.search(pattern, cleaned_result, re.DOTALL | re.IGNORECASE)
                 if match:
-                    json_content = match.group(1).strip()
-                    # Additional safety: limit JSON content size
-                    if len(json_content) > 10000:  # Reasonable limit for issue arrays
-                        logger.warning("JSON content too large, skipping")
-                        continue
                     try:
-                        result = json.loads(json_content)
-                        if isinstance(result, list):
-                            # SECURITY: Validate each issue object for expected structure
-                            validated_result = []
-                            for item in result:
-                                if isinstance(item, dict) and self._validate_issue_structure(item):
-                                    validated_result.append(item)
-                                else:
-                                    logger.warning("Invalid issue structure detected, skipping")
-                            if validated_result:
-                                logger.info(f"Strategy 1 success: Found {len(validated_result)} valid issues")
-                                return validated_result
-                    except json.JSONDecodeError as e:
-                        logger.info(f"Strategy 1 JSON decode failed: {e}")
+                        json_content = match.group(1).strip()
+                        # Additional safety: limit JSON content size
+                        if len(json_content) > 15000:  # Increased limit for nested structures
+                            logger.warning("JSON content too large, skipping")
+                            continue
+                        try:
+                            # Clean control characters that might break JSON parsing
+                            # Replace literal \n, \t, etc. in strings while preserving structure
+                            cleaned_json = self._clean_json_string(json_content)
+                            result = json.loads(cleaned_json)
+                            if isinstance(result, list):
+                                # SECURITY: Validate each issue object for expected structure
+                                validated_result = []
+                                for item in result:
+                                    try:
+                                        if isinstance(item, dict) and self._validate_issue_structure(item):
+                                            validated_result.append(item)
+                                        else:
+                                            logger.warning("Invalid issue structure detected, skipping")
+                                    except Exception as e:
+                                        logger.warning(f"Error validating issue structure: {e}")
+                                        continue
+                                if validated_result:
+                                    logger.info(f"Strategy 1 success: Found {len(validated_result)} valid issues")
+                                    return validated_result
+                        except json.JSONDecodeError as e:
+                            logger.info(f"Strategy 1 JSON decode failed: {e}")
+                            continue
+                        except Exception as e:
+                            logger.warning(f"Strategy 1 unexpected error: {e}")
+                            continue
+                    except IndexError as e:
+                        logger.warning(f"Strategy 1 capture group error: {e}")
+                        continue
+                    except Exception as e:
+                        logger.warning(f"Strategy 1 unexpected error: {e}")
                         continue
             except re.error as e:
                 logger.warning(f"Regex pattern failed: {e}")
+                continue
+            except Exception as e:
+                logger.warning(f"Strategy 1 unexpected error during regex: {e}")
                 continue
 
         # Strategy 2: Try direct JSON parsing (unwrapped responses)
@@ -1456,24 +1477,37 @@ Your response must be ONLY the JSON array, nothing else."""
         except json.JSONDecodeError as e:
             logger.info(f"Strategy 2 failed: {e}")
 
-        # Strategy 3: Extract JSON array with improved safety (limited patterns)
-        # Use more restrictive patterns to prevent ReDoS - limit character classes and use atomic groups
+        # Strategy 3: Extract JSON array with improved safety and better patterns
+        # IMPROVED: More flexible patterns that handle various JSON structures
         safe_json_patterns = [
-            r'\[\s*\{[^{}]*"severity"[^{}]*\}[^[\]]*?\]',  # Simple JSON array pattern
+            r'(\[[\s\S]*?\])',  # Any JSON array, handles nested structures
+            r'(\{[\s\S]*\})',   # Single JSON object (fallback)
         ]
 
         for pattern in safe_json_patterns:
             try:
                 match = re.search(pattern, cleaned_result, re.DOTALL)
                 if match:
-                    json_content = match.group(0)
-                    if len(json_content) > 10000:  # Safety limit
+                    json_content = match.group(1).strip()
+                    if len(json_content) > 15000:  # Safety limit
                         continue
                     try:
                         result = json.loads(json_content)
                         if isinstance(result, list):
-                            logger.info(f"Strategy 3 success: Found {len(result)} issues")
-                            return result
+                            # Validate and return issues
+                            validated_result = []
+                            for item in result:
+                                if isinstance(item, dict) and self._validate_issue_structure(item):
+                                    validated_result.append(item)
+                                else:
+                                    logger.warning("Invalid issue structure detected, skipping")
+                            if validated_result:
+                                logger.info(f"Strategy 3 success: Found {len(validated_result)} issues")
+                                return validated_result
+                        elif isinstance(result, dict) and self._validate_issue_structure(result):
+                            # Single issue object
+                            logger.info("Strategy 3 success: Found single issue object")
+                            return [result]
                     except json.JSONDecodeError as e:
                         logger.info(f"Strategy 3 JSON decode failed: {e}")
                         continue
@@ -1486,6 +1520,22 @@ Your response must be ONLY the JSON array, nothing else."""
         text_result = self._parse_text_to_issues(cleaned_result, code)
         logger.info(f"Text parsing result: {len(text_result)} issues")
         return text_result
+
+    def _clean_json_string(self, json_str: str) -> str:
+        """Clean control characters from JSON strings that might break parsing"""
+        try:
+            # Replace literal \n, \t, etc. with actual newline/tab characters in strings
+            # This handles cases where the AI includes actual newlines in JSON string values
+            # Use a simple approach: replace escaped sequences that are commonly problematic
+            cleaned = json_str.replace('\\n', '\n').replace('\\t', '\t').replace('\\r', '\r')
+
+            # For more complex cases, we could use a JSON parser that handles this better
+            # But this simple approach covers most common issues
+
+            return cleaned
+        except Exception as e:
+            logger.warning(f"Error cleaning JSON string: {e}")
+            return json_str
 
     def _validate_issue_structure(self, issue_dict: dict) -> bool:
         """Validate that an issue dictionary has the required structure"""
