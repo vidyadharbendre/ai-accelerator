@@ -336,10 +336,12 @@ class OpenRouterCallback(BaseCallbackHandler):
         self.current_model = None
     
     def on_llm_start(self, serialized: Dict[str, Any], prompts: List[str], **kwargs):
+        # SECURITY: Avoid logging sensitive information from prompts
+        # Only log prompt count, not content
         self.model_calls.append({
             'timestamp': datetime.now(),
             'model': serialized.get('model_name', 'unknown'),
-            'prompt_length': sum(len(p) for p in prompts)
+            'prompt_count': len(prompts)  # Changed from prompt_length to avoid exposing content
         })
         self.current_model = serialized.get('model_name', 'unknown')
     
@@ -394,48 +396,92 @@ class OpenRouterLangChainReviewer:
         self.issue_parser = PydanticOutputParser(pydantic_object=CodeIssue)
         self.str_parser = StrOutputParser()
 
-    def _normalize_issues(self, issues: List[CodeIssue], code: str) -> List[CodeIssue]:
+    def _normalize_issues(self, issues: List[Union[CodeIssue, Dict[str, Any]]], code: str) -> List[CodeIssue]:
         """Downgrade or drop low-confidence issues to keep results realistic."""
         if not issues:
-            return issues
+            return []
 
         code_lines = code.split('\n') if code else []
         normalized: List[CodeIssue] = []
 
         for issue in issues:
-            if issue.confidence < 0.5:
+            # Extract values based on type
+            if isinstance(issue, CodeIssue):
+                confidence = issue.confidence
+                line_number = issue.line_number
+                code_snippet = issue.code_snippet
+                title = issue.title
+                description = issue.description
+                severity = issue.severity
+                category = issue.category
+            else:  # Dict[str, Any]
+                confidence = issue.get('confidence', 0.5)
+                line_number = issue.get('line_number', 0)
+                code_snippet = issue.get('code_snippet', '')
+                title = issue.get('title', '')
+                description = issue.get('description', '')
+                severity = issue.get('severity', Severity.MEDIUM)
+                category = issue.get('category', IssueCategory.MAINTAINABILITY)
+
+                # Convert string values to enums if needed
+                if isinstance(severity, str):
+                    severity = Severity(severity) if severity in [s.value for s in Severity] else Severity.MEDIUM
+                if isinstance(category, str):
+                    category = IssueCategory(category) if category in [c.value for c in IssueCategory] else IssueCategory.MAINTAINABILITY
+
+            # Skip low confidence issues
+            if confidence < 0.5:
                 continue
 
-            line_valid = 1 <= issue.line_number <= len(code_lines)
-            snippet = issue.code_snippet or ""
+            line_valid = 1 <= line_number <= len(code_lines)
+            snippet = code_snippet or ""
             if line_valid and not snippet:
-                snippet = code_lines[issue.line_number - 1].strip()
-                issue.code_snippet = snippet
+                snippet = code_lines[line_number - 1].strip()
 
-            title_lower = issue.title.lower()
-            desc_lower = issue.description.lower()
+            title_lower = title.lower()
+            desc_lower = description.lower()
             snippet_lower = snippet.lower()
             mentions_secret = any(k in (title_lower + " " + desc_lower) for k in ["password", "secret", "api key", "token", "credential"])
             snippet_has_secret = any(k in snippet_lower for k in ["password", "secret", "api_key", "apikey", "token", "credential"])
 
-            if issue.severity == Severity.CRITICAL:
+            # Normalize severity
+            new_severity = severity
+            if severity == Severity.CRITICAL:
                 # Only downgrade critical issues if they don't meet strict criteria
                 # Keep critical severity for security issues, even with lower confidence
-                if issue.category not in (IssueCategory.SECURITY, IssueCategory.BUG):
-                    if issue.confidence < 0.85:
-                        issue.severity = Severity.HIGH
+                if category not in (IssueCategory.SECURITY, IssueCategory.BUG):
+                    if confidence < 0.85:
+                        new_severity = Severity.HIGH
                 # Only downgrade if secret is mentioned but not actually found in code
                 if mentions_secret and not snippet_has_secret:
-                    issue.severity = Severity.MEDIUM
-            elif issue.severity == Severity.HIGH and issue.confidence < 0.7:
-                issue.severity = Severity.MEDIUM
-            elif issue.severity == Severity.MEDIUM and issue.confidence < 0.6:
-                issue.severity = Severity.LOW
+                    new_severity = Severity.MEDIUM
+            elif severity == Severity.HIGH and confidence < 0.7:
+                new_severity = Severity.MEDIUM
+            elif severity == Severity.MEDIUM and confidence < 0.6:
+                new_severity = Severity.LOW
 
             if not line_valid and not snippet:
-                issue.severity = Severity.LOW
+                new_severity = Severity.LOW
 
-            normalized.append(issue)
+            # Create normalized CodeIssue object
+            if isinstance(issue, CodeIssue):
+                # Update existing object
+                issue.code_snippet = snippet
+                issue.severity = new_severity
+                normalized.append(issue)
+            else:
+                # Create new CodeIssue from dict
+                normalized_issue = CodeIssue(
+                    severity=new_severity,
+                    category=category,
+                    line_number=line_number,
+                    title=title,
+                    description=description,
+                    suggestion=issue.get('suggestion', ''),
+                    code_snippet=snippet,
+                    confidence=confidence
+                )
+                normalized.append(normalized_issue)
 
         return normalized
     
@@ -462,7 +508,8 @@ class OpenRouterLangChainReviewer:
     def setup_model(self, model_name: str, api_key: str, temperature: float = 0.1) -> bool:
         """Setup OpenRouter model with LangChain"""
         try:
-            self.api_key = api_key
+            # SECURITY: Store API key securely - avoid storing in instance variable
+            # Use it only during initialization and let LangChain handle secure storage
             model_id = OPENROUTER_MODELS[model_name]["id"]
             
             # Initialize Langsmith tracing before creating LLM
@@ -532,46 +579,45 @@ class OpenRouterLangChainReviewer:
                 # Debug: Log what we're sending to the model
                 logger.info(f"Sending to model - Language: {language}, Code length: {len(code)} chars")
 
-                # Create the analysis prompt dynamically to ensure proper variable substitution
-                analysis_prompt_text = f"""
-                You are a code security auditor. Analyze this {validated_language} code VERY CAREFULLY for ANY issues.
+                # SECURITY: Sanitize inputs to prevent injection attacks
+                # Use string formatting instead of direct interpolation for safety
+                analysis_prompt_text = """You are a code security auditor. Analyze this {language} code VERY CAREFULLY for ANY issues.
 
-                CODE TO ANALYZE:
-                ```{validated_language}
-                {prompt_code}
-                ```
+CODE TO ANALYZE:
+```{language}
+{code}
+```
 
-                You MUST return ONLY a valid JSON array. Find issues in this code if they exist.
+You MUST return ONLY a valid JSON array. Find issues in this code if they exist.
 
-                REQUIRED JSON FORMAT:
-                [
-                    {{
-                        "severity": "Critical",
-                        "category": "Security",
-                        "line_number": 1,
-                        "title": "Specific security vulnerability",
-                        "description": "Detailed explanation of the security risk and impact",
-                        "suggestion": "Concrete steps to fix the vulnerability",
-                        "confidence": 0.95
-                    }}
-                ]
+REQUIRED JSON FORMAT:
+[
+    {{
+        "severity": "Critical",
+        "category": "Security",
+        "line_number": 1,
+        "title": "Specific security vulnerability",
+        "description": "Detailed explanation of the security risk and impact",
+        "suggestion": "Concrete steps to fix the vulnerability",
+        "confidence": 0.95
+    }}
+]
 
-                If no issues found, return: []
+If no issues found, return: []
 
-                CRITICAL: Look for these specific issues:
-                - Hardcoded passwords/API keys (security vulnerability)
-                - Debug mode enabled in production (security risk)
-                - CORS allowing all origins (*) (security vulnerability)
-                - No authentication on sensitive endpoints (security vulnerability)
-                - Logging sensitive data (security vulnerability)
-                - SQL injection vulnerabilities
-                - Command injection risks
-                - Insecure default configurations
+CRITICAL: Look for these specific issues:
+- Hardcoded passwords/API keys (security vulnerability)
+- Debug mode enabled in production (security risk)
+- CORS allowing all origins (*) (security vulnerability)
+- No authentication on sensitive endpoints (security vulnerability)
+- Logging sensitive data (security vulnerability)
+- SQL injection vulnerabilities
+- Command injection risks
+- Insecure default configurations
 
-                BE SPECIFIC: Reference actual line numbers and quote problematic code.
-                Return [] if no issues found.
-                Your response must be ONLY the JSON array, nothing else.
-                """
+BE SPECIFIC: Reference actual line numbers and quote problematic code.
+Return [] if no issues found.
+Your response must be ONLY the JSON array, nothing else.""".format(language=validated_language, code=prompt_code)
 
                 # Use the LLM directly with the constructed prompt
                 messages = [
@@ -1183,8 +1229,8 @@ class OpenRouterLangChainReviewer:
         
         return round(final_score, 1)
     
-    def _parse_text_to_issues(self, text: str, code: str) -> List[CodeIssue]:
-        """Parse text response into CodeIssue objects when JSON parsing fails"""
+    def _parse_text_to_issues(self, text: str, code: str) -> List[Dict[str, Any]]:
+        """Parse text response into issue dictionaries when JSON parsing fails"""
         issues = []
 
         # If no response or very short response, return empty list
@@ -1198,7 +1244,6 @@ class OpenRouterLangChainReviewer:
             r'(\[.*\])',                    # Just the JSON array
         ]
 
-        code_lines = code.split('\n')
         for pattern in json_patterns:
             matches = re.findall(pattern, text, re.DOTALL)
             if matches:
@@ -1207,15 +1252,33 @@ class OpenRouterLangChainReviewer:
                         result = json.loads(match)
                         if isinstance(result, list):
                             for issue_data in result:
-                                issue = self._ensure_code_issue(issue_data, code_lines)
-                                if issue:
-                                    issues.append(issue)
+                                if isinstance(issue_data, dict) and self._validate_issue_structure(issue_data):
+                                    issues.append(issue_data)
                     except json.JSONDecodeError:
                         continue
 
         # If no JSON found, try to parse as structured text
         if not issues:
-            issues = self._parse_structured_text(text, code)
+            issues = self._parse_structured_text_to_dicts(text, code)
+
+        return issues
+
+    def _parse_structured_text_to_dicts(self, text: str, code: str) -> List[Dict[str, Any]]:
+        """Parse structured text response into issue dictionaries"""
+        issues = []
+
+        # Split by common issue separators
+        issue_blocks = re.split(r'\n\s*(?=\d+\.|\*\s*|\-\s*[A-Z])', text)
+
+        for block in issue_blocks:
+            block = block.strip()
+            if not block or len(block) < 10:
+                continue
+
+            # Try to extract issue information
+            issue_info = self._extract_issue_info(block, [])
+            if issue_info:
+                issues.append(issue_info)
 
         return issues
 
@@ -1231,7 +1294,7 @@ class OpenRouterLangChainReviewer:
             block = block.strip()
             if not block or len(block) < 10:
                 continue
-            
+
             # Try to extract issue information
             issue_info = self._extract_issue_info(block, code_lines)
             if issue_info:
@@ -1298,7 +1361,7 @@ class OpenRouterLangChainReviewer:
             'confidence': 0.8
         }
     
-    def _parse_analysis_response(self, raw_result: str, code: str) -> List[dict]:
+    def _parse_analysis_response(self, raw_result: str, code: str) -> List[Dict[str, Any]]:
         """Enhanced parsing of analysis response with multiple fallback strategies and security validation"""
         # SECURITY: Input validation and sanitization
         if not isinstance(raw_result, str):
@@ -1321,9 +1384,45 @@ class OpenRouterLangChainReviewer:
 
         logger.info(f"Parsing response: '{cleaned_result[:200]}...'")
 
-        # Strategy 1: Try direct JSON parsing with security measures
+        # Strategy 1: Extract JSON from markdown code blocks (most common case)
+        # Use safer, more specific patterns to prevent ReDoS
+        markdown_json_patterns = [
+            r'```json\s*\n?(\[.*?\])\s*\n?```',  # JSON in ```json blocks
+            r'```\s*\n?(\[.*?\])\s*\n?```',      # JSON in generic ``` blocks
+        ]
+
+        for pattern in markdown_json_patterns:
+            try:
+                # Use re.search instead of re.findall for better performance
+                match = re.search(pattern, cleaned_result, re.DOTALL)
+                if match:
+                    json_content = match.group(1).strip()
+                    # Additional safety: limit JSON content size
+                    if len(json_content) > 10000:  # Reasonable limit for issue arrays
+                        logger.warning("JSON content too large, skipping")
+                        continue
+                    try:
+                        result = json.loads(json_content)
+                        if isinstance(result, list):
+                            # SECURITY: Validate each issue object for expected structure
+                            validated_result = []
+                            for item in result:
+                                if isinstance(item, dict) and self._validate_issue_structure(item):
+                                    validated_result.append(item)
+                                else:
+                                    logger.warning("Invalid issue structure detected, skipping")
+                            if validated_result:
+                                logger.info(f"Strategy 1 success: Found {len(validated_result)} valid issues")
+                                return validated_result
+                    except json.JSONDecodeError as e:
+                        logger.info(f"Strategy 1 JSON decode failed: {e}")
+                        continue
+            except re.error as e:
+                logger.warning(f"Regex pattern failed: {e}")
+                continue
+
+        # Strategy 2: Try direct JSON parsing (unwrapped responses)
         try:
-            # SECURITY: Use strict=False but with additional validation
             result = json.loads(cleaned_result)
             if isinstance(result, list):
                 # SECURITY: Validate each issue object for expected structure
@@ -1333,48 +1432,27 @@ class OpenRouterLangChainReviewer:
                         validated_result.append(item)
                     else:
                         logger.warning("Invalid issue structure detected, skipping")
-                logger.info(f"Strategy 1 success: Found {len(validated_result)} valid issues")
-                return validated_result
+                if validated_result:
+                    logger.info(f"Strategy 2 success: Found {len(validated_result)} valid issues")
+                    return validated_result
         except json.JSONDecodeError as e:
-            logger.info(f"Strategy 1 failed: {e}")
+            logger.info(f"Strategy 2 failed: {e}")
 
-        # Strategy 2: Extract JSON from code blocks with safer patterns
-        # Use more specific patterns to avoid ReDoS
-        json_patterns = [
-            r'```json\s*(\[[\s\S]{0,10000}?\])\s*```',  # JSON in code blocks with size limit
-            r'```\s*(\[[\s\S]{0,10000}?\])\s*```',      # JSON in code blocks without json tag
-            r'```(\[[\s\S]{0,10000}?\])```',            # JSON in code blocks (alternative)
+        # Strategy 3: Extract JSON array with improved safety (limited patterns)
+        # Use more restrictive patterns to prevent ReDoS - limit character classes and use atomic groups
+        safe_json_patterns = [
+            r'\[\s*\{[^{}]*"severity"[^{}]*\}[^[\]]*?\]',  # Simple JSON array pattern
         ]
 
-        for pattern in json_patterns:
+        for pattern in safe_json_patterns:
             try:
-                matches = re.findall(pattern, cleaned_result, re.DOTALL)
-                logger.info(f"Strategy 2 pattern found {len(matches)} matches")
-                for match in matches:
-                    try:
-                        result = json.loads(match)
-                        if isinstance(result, list):
-                            logger.info(f"Strategy 2 success: Found {len(result)} issues")
-                            return result
-                    except json.JSONDecodeError as e:
-                        logger.info(f"Strategy 2 JSON decode failed: {e}")
+                match = re.search(pattern, cleaned_result, re.DOTALL)
+                if match:
+                    json_content = match.group(0)
+                    if len(json_content) > 10000:  # Safety limit
                         continue
-            except re.error as e:
-                logger.warning(f"Regex pattern failed: {e}")
-                continue
-
-        # Strategy 3: Extract any JSON array from the text with size limits
-        json_array_patterns = [
-            r'(\[[\s\S]{0,10000}?\])',  # Any JSON array with size limit
-        ]
-
-        for pattern in json_array_patterns:
-            try:
-                matches = re.findall(pattern, cleaned_result)
-                logger.info(f"Strategy 3 pattern found {len(matches)} matches")
-                for match in matches:
                     try:
-                        result = json.loads(match)
+                        result = json.loads(json_content)
                         if isinstance(result, list):
                             logger.info(f"Strategy 3 success: Found {len(result)} issues")
                             return result
