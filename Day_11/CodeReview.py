@@ -100,6 +100,7 @@ def _initialize_langsmith():
         langsmith_key = _require_env_var('LANGSMITH_API_KEY')
 
         # Create Langsmith client with explicit API key
+        from pydantic import SecretStr
         _langsmith_client = langsmith.Client(api_key=langsmith_key)
 
         # Set environment variables for tracing (CORRECT format from docs)
@@ -112,6 +113,11 @@ def _initialize_langsmith():
 
         _langsmith_initialized = True
         logger.info("✅ Langsmith tracing initialized successfully")
+
+        # Log current tracing configuration for debugging
+        logger.info(f"🔍 LangSmith Project: {os.environ.get('LANGSMITH_PROJECT')}")
+        logger.info(f"🔗 LangSmith Tracing: {os.environ.get('LANGSMITH_TRACING')}")
+
         return _langsmith_client
 
     except EnvironmentError:
@@ -403,19 +409,22 @@ class OpenRouterLangChainReviewer:
         self.str_parser = StrOutputParser()
 
     def _normalize_issues(self, issues: List[Union[CodeIssue, Dict[str, Any]]], code: str) -> List[CodeIssue]:
-        """Downgrade or drop low-confidence issues to keep results realistic."""
+        """Normalize issues, remove duplicates, and downgrade over-severity."""
         if not issues:
             return []
 
         code_lines = code.split('\n') if code else []
         normalized: List[CodeIssue] = []
 
+        # Track unique issues to prevent duplicates
+        seen_issues = set()
+
         for issue in issues:
             # Extract values based on type
             if isinstance(issue, CodeIssue):
                 confidence = issue.confidence
                 line_number = issue.line_number
-                code_snippet = issue.code_snippet
+                code_snippet = issue.code_snippet or ""
                 title = issue.title
                 description = issue.description
                 severity = issue.severity
@@ -435,61 +444,111 @@ class OpenRouterLangChainReviewer:
                 if isinstance(category, str):
                     category = IssueCategory(category) if category in [c.value for c in IssueCategory] else IssueCategory.MAINTAINABILITY
 
-            # Skip low confidence issues
-            if confidence < 0.5:
+            # Skip issues with very low confidence or empty titles
+            if confidence < 0.4 or not title.strip():
                 continue
 
+            # Validate line number
             line_valid = 1 <= line_number <= len(code_lines)
-            snippet = code_snippet or ""
-            if line_valid and not snippet:
-                snippet = code_lines[line_number - 1].strip()
 
-            title_lower = title.lower()
-            desc_lower = description.lower()
-            snippet_lower = snippet.lower()
-            mentions_secret = any(k in (title_lower + " " + desc_lower) for k in ["password", "secret", "api key", "token", "credential"])
-            snippet_has_secret = any(k in snippet_lower for k in ["password", "secret", "api_key", "apikey", "token", "credential"])
+            # Get code snippet if valid line number
+            if line_valid and not code_snippet:
+                code_snippet = code_lines[line_number - 1].strip()
 
-            # Normalize severity
+            # Create a unique key for deduplication based on content similarity
+            issue_key = (
+                title.lower().strip()[:50],  # First 50 chars of title
+                description.lower().strip()[:100],  # First 100 chars of description
+                line_number if line_valid else 0,
+                category.value
+            )
+
+            # Skip if we've seen a very similar issue
+            if issue_key in seen_issues:
+                continue
+            seen_issues.add(issue_key)
+
+            # Normalize severity based on realistic assessment
             new_severity = severity
+
+            # Be more conservative with critical issues
             if severity == Severity.CRITICAL:
-                # Only downgrade critical issues if they don't meet strict criteria
-                # Keep critical severity for security issues, even with lower confidence
-                if category not in (IssueCategory.SECURITY, IssueCategory.BUG):
-                    if confidence < 0.85:
-                        new_severity = Severity.HIGH
-                # Only downgrade if secret is mentioned but not actually found in code
-                if mentions_secret and not snippet_has_secret:
-                    new_severity = Severity.MEDIUM
+                # Only keep critical for actual security vulnerabilities with evidence
+                title_lower = title.lower()
+                desc_lower = description.lower()
+                is_real_security = (
+                    any(word in title_lower for word in ['hardcoded', 'exposed', 'injection', 'vulnerable']) or
+                    any(word in desc_lower for word in ['hardcoded', 'exposed', 'injection', 'vulnerable'])
+                ) and confidence > 0.8
+
+                if not is_real_security:
+                    new_severity = Severity.HIGH if confidence > 0.7 else Severity.MEDIUM
+
+            # Downgrade based on confidence and evidence
             elif severity == Severity.HIGH and confidence < 0.7:
                 new_severity = Severity.MEDIUM
-            elif severity == Severity.MEDIUM and confidence < 0.6:
+            elif severity == Severity.MEDIUM and confidence < 0.5:
                 new_severity = Severity.LOW
 
-            if not line_valid and not snippet:
+            # Downgrade if no valid line number and no snippet
+            if not line_valid and not code_snippet:
                 new_severity = Severity.LOW
 
             # Create normalized CodeIssue object
-            if isinstance(issue, CodeIssue):
-                # Update existing object
-                issue.code_snippet = snippet
-                issue.severity = new_severity
-                normalized.append(issue)
-            else:
-                # Create new CodeIssue from dict
-                normalized_issue = CodeIssue(
-                    severity=new_severity,
-                    category=category,
-                    line_number=line_number,
-                    title=title,
-                    description=description,
-                    suggestion=issue.get('suggestion', ''),
-                    code_snippet=snippet,
-                    confidence=confidence
-                )
-                normalized.append(normalized_issue)
+            normalized_issue = CodeIssue(
+                severity=new_severity,
+                category=category,
+                line_number=line_number,
+                title=title.strip(),
+                description=description.strip(),
+                suggestion=issue.get('suggestion', '').strip() if isinstance(issue, dict) else issue.suggestion,
+                code_snippet=code_snippet,
+                confidence=min(confidence, 0.95)  # Cap confidence at 95%
+            )
 
-        return normalized
+            normalized.append(normalized_issue)
+
+        # Final deduplication pass - remove issues that are too similar
+        final_issues = self._deduplicate_similar_issues(normalized)
+
+        return final_issues
+
+    def _deduplicate_similar_issues(self, issues: List[CodeIssue]) -> List[CodeIssue]:
+        """Remove issues that are essentially duplicates with slight variations."""
+        if len(issues) <= 1:
+            return issues
+
+        unique_issues = []
+
+        for issue in issues:
+            is_duplicate = False
+
+            for existing in unique_issues:
+                # Check if issues are similar (same title, similar line, same category)
+                title_similar = issue.title.lower().strip() == existing.title.lower().strip()
+                line_close = abs(issue.line_number - existing.line_number) <= 2
+                same_category = issue.category == existing.category
+
+                if title_similar and (line_close or same_category):
+                    # Keep the higher confidence/higher severity one
+                    if (issue.confidence > existing.confidence or
+                        (issue.confidence == existing.confidence and
+                         self._severity_rank(issue.severity) > self._severity_rank(existing.severity))):
+                        # Replace existing with current
+                        unique_issues.remove(existing)
+                        unique_issues.append(issue)
+                    is_duplicate = True
+                    break
+
+            if not is_duplicate:
+                unique_issues.append(issue)
+
+        return unique_issues
+
+    def _severity_rank(self, severity: Severity) -> int:
+        """Get numeric rank for severity comparison."""
+        ranks = {Severity.CRITICAL: 4, Severity.HIGH: 3, Severity.MEDIUM: 2, Severity.LOW: 1}
+        return ranks.get(severity, 0)
     
     def _setup_prompts(self):
         """Setup LangChain prompt templates"""
@@ -674,9 +733,9 @@ Your response must be ONLY the JSON array, nothing else."""
                         issues.append(issue)
                     else:
                         logger.warning("Skipping invalid issue data during parsing")
-            elif isinstance(result, str):
-                # Handle case where result is still a string
-                issues = self._parse_text_to_issues(result, code)
+            else:
+                # Handle case where result is still a string or other type
+                issues = self._parse_text_to_issues(str(result), code)
 
             # Normalize issues to avoid over-severity
             issues = self._normalize_issues(issues, code)
@@ -1070,7 +1129,7 @@ Your response must be ONLY the JSON array, nothing else."""
 
                     # Clean any remaining placeholders from LLM response
                     cleaned_summary = self._clean_summary_placeholders(
-                        summary, language, len(code.split('\n')), len(issues), self.current_model
+                        summary, language, len(code.split('\n')), len(issues), self.current_model or "Unknown"
                     )
                     return cleaned_summary
                 except Exception as e:
@@ -1379,7 +1438,7 @@ Your response must be ONLY the JSON array, nothing else."""
         }
     
     def _parse_analysis_response(self, raw_result: str, code: str) -> List[Dict[str, Any]]:
-        """Enhanced parsing of analysis response with multiple fallback strategies and security validation"""
+        """Simplified and more reliable parsing of analysis response"""
         # SECURITY: Input validation and sanitization
         if not isinstance(raw_result, str):
             logger.warning("Non-string input received for JSON parsing")
@@ -1400,137 +1459,55 @@ Your response must be ONLY the JSON array, nothing else."""
             return []
 
         logger.info(f"Parsing response length: {len(cleaned_result)} chars")
-        logger.debug(f"Parsing response preview: '{cleaned_result[:300]}...'")
 
-        # Strategy 1: Extract JSON from markdown code blocks (most common case)
-        # IMPROVED: Use more robust patterns that handle nested structures and escape control chars
-        markdown_json_patterns = [
-            r'```json\s*\n?(\[[\s\S]*?\])\s*\n?```',  # JSON in ```json blocks - handles nested
-            r'```\s*\n?(\[[\s\S]*?\])\s*\n?```',      # JSON in generic ``` blocks - handles nested
-            r'```\w*\s*\n?(\[[\s\S]*?\])\s*\n?```',   # Any code block with JSON array
-        ]
-
-        for pattern in markdown_json_patterns:
+        # Strategy 1: Extract JSON from markdown code blocks
+        json_match = re.search(r'```(?:json)?\s*\n?(\[[\s\S]*?\])\s*\n?```', cleaned_result, re.IGNORECASE | re.DOTALL)
+        if json_match:
             try:
-                # Use re.search instead of re.findall for better performance
-                match = re.search(pattern, cleaned_result, re.DOTALL | re.IGNORECASE)
-                if match:
-                    try:
-                        json_content = match.group(1).strip()
-                        # Additional safety: limit JSON content size
-                        if len(json_content) > 15000:  # Increased limit for nested structures
-                            logger.warning("JSON content too large, skipping")
-                            continue
-                        try:
-                            # Clean control characters that might break JSON parsing
-                            # Replace literal \n, \t, etc. in strings while preserving structure
-                            cleaned_json = self._clean_json_string(json_content)
-                            result = json.loads(cleaned_json)
-                            if isinstance(result, list):
-                                # SECURITY: Validate each issue object for expected structure
-                                validated_result = []
-                                for item in result:
-                                    try:
-                                        if isinstance(item, dict) and self._validate_issue_structure(item):
-                                            validated_result.append(item)
-                                        else:
-                                            logger.warning("Invalid issue structure detected, skipping")
-                                    except Exception as e:
-                                        logger.warning(f"Error validating issue structure: {e}")
-                                        continue
-                                if validated_result:
-                                    logger.info(f"Strategy 1 success: Found {len(validated_result)} valid issues")
-                                    return validated_result
-                        except json.JSONDecodeError as e:
-                            logger.info(f"Strategy 1 JSON decode failed: {e}")
-                            continue
-                        except Exception as e:
-                            logger.warning(f"Strategy 1 unexpected error: {e}")
-                            continue
-                    except IndexError as e:
-                        logger.warning(f"Strategy 1 capture group error: {e}")
-                        continue
-                    except Exception as e:
-                        logger.warning(f"Strategy 1 unexpected error: {e}")
-                        continue
-            except re.error as e:
-                logger.warning(f"Regex pattern failed: {e}")
-                continue
-            except Exception as e:
-                logger.warning(f"Strategy 1 unexpected error during regex: {e}")
-                continue
+                json_content = self._clean_json_string(json_match.group(1).strip())
+                result = json.loads(json_content)
+                if isinstance(result, list) and result:
+                    validated_result = [item for item in result if isinstance(item, dict) and self._validate_issue_structure(item)]
+                    if validated_result:
+                        logger.info(f"Successfully parsed {len(validated_result)} issues from JSON block")
+                        return validated_result
+            except (json.JSONDecodeError, AttributeError) as e:
+                logger.info(f"JSON parsing failed: {e}")
 
-        # Strategy 2: Try direct JSON parsing (unwrapped responses)
+        # Strategy 2: Try direct JSON parsing
         try:
             result = json.loads(cleaned_result)
-            if isinstance(result, list):
-                # SECURITY: Validate each issue object for expected structure
-                validated_result = []
-                for item in result:
-                    if isinstance(item, dict) and self._validate_issue_structure(item):
-                        validated_result.append(item)
-                    else:
-                        logger.warning("Invalid issue structure detected, skipping")
+            if isinstance(result, list) and result:
+                validated_result = [item for item in result if isinstance(item, dict) and self._validate_issue_structure(item)]
                 if validated_result:
-                    logger.info(f"Strategy 2 success: Found {len(validated_result)} valid issues")
+                    logger.info(f"Successfully parsed {len(validated_result)} issues from direct JSON")
                     return validated_result
-        except json.JSONDecodeError as e:
-            logger.info(f"Strategy 2 failed: {e}")
+        except json.JSONDecodeError:
+            pass
 
-        # Strategy 3: Extract JSON array with improved safety and better patterns
-        # IMPROVED: More flexible patterns that handle various JSON structures
-        safe_json_patterns = [
-            r'(\[[\s\S]*?\])',  # Any JSON array, handles nested structures
-            r'(\{[\s\S]*\})',   # Single JSON object (fallback)
-        ]
-
-        for pattern in safe_json_patterns:
-            try:
-                match = re.search(pattern, cleaned_result, re.DOTALL)
-                if match:
-                    json_content = match.group(1).strip()
-                    if len(json_content) > 15000:  # Safety limit
-                        continue
-                    try:
-                        result = json.loads(json_content)
-                        if isinstance(result, list):
-                            # Validate and return issues
-                            validated_result = []
-                            for item in result:
-                                if isinstance(item, dict) and self._validate_issue_structure(item):
-                                    validated_result.append(item)
-                                else:
-                                    logger.warning("Invalid issue structure detected, skipping")
-                            if validated_result:
-                                logger.info(f"Strategy 3 success: Found {len(validated_result)} issues")
-                                return validated_result
-                        elif isinstance(result, dict) and self._validate_issue_structure(result):
-                            # Single issue object
-                            logger.info("Strategy 3 success: Found single issue object")
-                            return [result]
-                    except json.JSONDecodeError as e:
-                        logger.info(f"Strategy 3 JSON decode failed: {e}")
-                        continue
-            except re.error as e:
-                logger.warning(f"Regex pattern failed: {e}")
-                continue
-
-        # Strategy 4: Try to find structured content and parse as text
-        logger.warning("All JSON parsing strategies failed, attempting text-based parsing")
+        # Strategy 3: Fallback to text parsing
+        logger.warning("JSON parsing failed, falling back to text parsing")
         text_result = self._parse_text_to_issues(cleaned_result, code)
-        logger.info(f"Text parsing result: {len(text_result)} issues")
         return text_result
 
     def _clean_json_string(self, json_str: str) -> str:
-        """Clean control characters from JSON strings that might break parsing"""
+        """Clean and normalize JSON strings for better parsing"""
         try:
-            # Replace literal \n, \t, etc. with actual newline/tab characters in strings
-            # This handles cases where the AI includes actual newlines in JSON string values
-            # Use a simple approach: replace escaped sequences that are commonly problematic
-            cleaned = json_str.replace('\\n', '\n').replace('\\t', '\t').replace('\\r', '\r')
+            # Remove BOM if present
+            cleaned = json_str.lstrip('\ufeff')
 
-            # For more complex cases, we could use a JSON parser that handles this better
-            # But this simple approach covers most common issues
+            # Handle common escape sequences in string values
+            # Replace literal escape sequences that the AI might include
+            cleaned = cleaned.replace('\\n', '\n').replace('\\t', '\t').replace('\\r', '\r')
+            cleaned = cleaned.replace('\\"', '"').replace("\\'", "'")
+
+            # Remove any control characters that aren't valid in JSON
+            import unicodedata
+            cleaned = ''.join(char for char in cleaned if unicodedata.category(char)[0] != 'C' or char in '\t\n\r')
+
+            # Fix common JSON formatting issues
+            # Remove trailing commas before closing brackets/braces
+            cleaned = re.sub(r',(\s*[}\]])', r'\1', cleaned)
 
             return cleaned
         except Exception as e:
@@ -1758,7 +1735,7 @@ Your response must be ONLY the JSON array, nothing else."""
         logger.info(f"Detected {len(issues)} obvious issues")
         return issues
 
-    def _clean_summary_placeholders(self, summary: str, language: str, loc: int, total_issues: int, model_name: str) -> str:
+    def _clean_summary_placeholders(self, summary: Union[str, Any], language: str, loc: int, total_issues: int, model_name: Optional[str]) -> str:
         """Clean any remaining placeholders in the summary text"""
         # Replace any remaining placeholders that the LLM might have left
         replacements = {
