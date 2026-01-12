@@ -1,15 +1,13 @@
 import streamlit as st
+from streamlit.runtime.scriptrunner import get_script_run_ctx
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
-from langchain_core.prompts import ChatPromptTemplate, PromptTemplate
+from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import JsonOutputParser, StrOutputParser, PydanticOutputParser
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.chains import LLMChain
-from langchain.schema import Document
-from langchain.memory import ConversationBufferMemory
-from langchain.callbacks.base import BaseCallbackHandler
+from langchain_core.documents import Document
+from langchain_core.callbacks.base import BaseCallbackHandler
 from langchain_core.runnables import RunnablePassthrough, RunnableParallel
-from langchain_core.runnables.config import RunnableConfig
 
 import json
 import asyncio
@@ -31,6 +29,56 @@ from dotenv import load_dotenv
 _langsmith_initialized = False
 _langsmith_client = None
 
+SUPPORTED_LANGUAGES = [
+    "Python", "JavaScript", "TypeScript", "Java", "C++", "Go", "Rust",
+    "PHP", "C#", "Swift", "Kotlin", "Ruby", "Scala", "SQL"
+]
+
+MAX_PROMPT_CODE_CHARS = 200_000
+
+
+def _require_env_var(name: str) -> str:
+    """Return the value of a required environment variable, raise if absent."""
+    value = os.getenv(name)
+    if not value:
+        # Generic error message to avoid exposing sensitive variable names
+        msg = "Required environment variable is missing. Please check your configuration."
+        # SECURITY: Avoid logging sensitive environment variable names
+        logger.error("Environment configuration error - required variable missing")
+        raise EnvironmentError(msg)
+    return value
+
+
+def _require_supported_language(language: str) -> str:
+    """Validate that the provided language is in the supported list."""
+    if not language:
+        raise ValueError("Language is required.")
+    normalized = language.strip()
+    for option in SUPPORTED_LANGUAGES:
+        if normalized.lower() == option.lower():
+            return option
+    raise ValueError(f"Unsupported language '{language}'.")
+
+
+def _prepare_code_for_prompt(code: str, max_chars: int = MAX_PROMPT_CODE_CHARS) -> str:
+    """Trim and escape code before interpolating into prompts."""
+    if code is None:
+        raise ValueError("Code input cannot be None")
+    if not isinstance(code, str):
+        raise TypeError("Code input must be a string")
+
+    cleaned = code.strip()
+    if len(cleaned) > max_chars:
+        logger.warning(
+            "Code is very large; truncating to %d characters for prompt safety.",
+            max_chars
+        )
+        cleaned = cleaned[:max_chars]
+
+    cleaned = cleaned.replace("```", "`\u200b``")  # break out of triple-backtick blocks
+    return cleaned
+
+
 def _initialize_langsmith():
     """Initialize Langsmith tracing - called at runtime"""
     global _langsmith_initialized, _langsmith_client
@@ -42,11 +90,8 @@ def _initialize_langsmith():
         # Load environment variables
         load_dotenv()
 
-        # Check API keys
-        langsmith_key = os.getenv('LANGSMITH_API_KEY')
-        if not langsmith_key:
-            logger.warning("LANGSMITH_API_KEY not found in environment")
-            return None
+        # Require API key before continuing
+        langsmith_key = _require_env_var('LANGSMITH_API_KEY')
 
         # Create Langsmith client with explicit API key
         _langsmith_client = langsmith.Client(api_key=langsmith_key)
@@ -63,6 +108,9 @@ def _initialize_langsmith():
         logger.info("✅ Langsmith tracing initialized successfully")
         return _langsmith_client
 
+    except EnvironmentError:
+        # Required env var missing, already logged
+        return None
     except Exception as e:
         logger.error(f"Failed to initialize Langsmith: {e}")
         return None
@@ -114,13 +162,13 @@ class AnalysisResult(BaseModel):
 OPENROUTER_MODELS = {
     # Free Models
     "Grok 4 Fast (Free)": {
-        "id": "x-ai/grok-4-fast:free",
+        "id": "x-ai/grok-4-fast-free",
         "context": "32K tokens",
         "cost": "FREE - No credits required",
         "provider": "xAI"
     },
     "Grok 4o Mini (Free)": {
-        "id": "x-ai/grok-4o-mini:free",
+        "id": "x-ai/grok-4o-mini-free",
         "context": "32K tokens",
         "cost": "FREE - Fast and efficient",
         "provider": "xAI"
@@ -300,7 +348,7 @@ class OpenRouterCallback(BaseCallbackHandler):
             usage = response.llm_output.get('token_usage', {})
             tokens = usage.get('total_tokens', 0)
             self.total_tokens += tokens
-            
+
             # Estimate cost (rough estimates)
             cost_estimates = {
                 'gpt-4': 0.03 * tokens / 1000,
@@ -308,13 +356,23 @@ class OpenRouterCallback(BaseCallbackHandler):
                 'claude-3': 0.015 * tokens / 1000,
                 'gemini': 0.001 * tokens / 1000
             }
-            
-            model_family = self.current_model.split('/')[0] if '/' in self.current_model else self.current_model
+
+            model_family = 'unknown'
+            if self.current_model:
+                if '/' in self.current_model:
+                    model_family = self.current_model.split('/')[0]
+                else:
+                    model_family = self.current_model
             estimated_cost = cost_estimates.get(model_family, 0.01 * tokens / 1000)
             self.total_cost += estimated_cost
 
 class OpenRouterLangChainReviewer:
-    """LangChain-based code reviewer using OpenRouter API"""
+    """LangChain-based code reviewer using OpenRouter API.
+
+    This class provides comprehensive code analysis capabilities using various
+    AI models through OpenRouter, with structured output parsing and
+    LangChain integration for security, performance, and maintainability analysis.
+    """
     
     def __init__(self):
         self.llm = None
@@ -324,10 +382,6 @@ class OpenRouterLangChainReviewer:
             chunk_size=4000,
             chunk_overlap=200,
             separators=["\n\n", "\n", "class ", "def ", "function ", "//", "#", "```"]
-        )
-        self.memory = ConversationBufferMemory(
-            memory_key="chat_history",
-            return_messages=True
         )
         self.callback = OpenRouterCallback()
         self._setup_parsers()
@@ -339,6 +393,51 @@ class OpenRouterLangChainReviewer:
         self.pydantic_parser = PydanticOutputParser(pydantic_object=AnalysisResult)
         self.issue_parser = PydanticOutputParser(pydantic_object=CodeIssue)
         self.str_parser = StrOutputParser()
+
+    def _normalize_issues(self, issues: List[CodeIssue], code: str) -> List[CodeIssue]:
+        """Downgrade or drop low-confidence issues to keep results realistic."""
+        if not issues:
+            return issues
+
+        code_lines = code.split('\n') if code else []
+        normalized: List[CodeIssue] = []
+
+        for issue in issues:
+            if issue.confidence < 0.5:
+                continue
+
+            line_valid = 1 <= issue.line_number <= len(code_lines)
+            snippet = issue.code_snippet or ""
+            if line_valid and not snippet:
+                snippet = code_lines[issue.line_number - 1].strip()
+                issue.code_snippet = snippet
+
+            title_lower = issue.title.lower()
+            desc_lower = issue.description.lower()
+            snippet_lower = snippet.lower()
+            mentions_secret = any(k in (title_lower + " " + desc_lower) for k in ["password", "secret", "api key", "token", "credential"])
+            snippet_has_secret = any(k in snippet_lower for k in ["password", "secret", "api_key", "apikey", "token", "credential"])
+
+            if issue.severity == Severity.CRITICAL:
+                # Only downgrade critical issues if they don't meet strict criteria
+                # Keep critical severity for security issues, even with lower confidence
+                if issue.category not in (IssueCategory.SECURITY, IssueCategory.BUG):
+                    if issue.confidence < 0.85:
+                        issue.severity = Severity.HIGH
+                # Only downgrade if secret is mentioned but not actually found in code
+                if mentions_secret and not snippet_has_secret:
+                    issue.severity = Severity.MEDIUM
+            elif issue.severity == Severity.HIGH and issue.confidence < 0.7:
+                issue.severity = Severity.MEDIUM
+            elif issue.severity == Severity.MEDIUM and issue.confidence < 0.6:
+                issue.severity = Severity.LOW
+
+            if not line_valid and not snippet:
+                issue.severity = Severity.LOW
+
+            normalized.append(issue)
+
+        return normalized
     
     def _setup_prompts(self):
         """Setup LangChain prompt templates"""
@@ -377,9 +476,8 @@ class OpenRouterLangChainReviewer:
             self.llm = ChatOpenAI(
                 model=model_id,
                 temperature=temperature,
-                openai_api_key=api_key,
-                openai_api_base="https://openrouter.ai/api/v1",
-                max_tokens=4000,
+                api_key=api_key,
+                base_url="https://openrouter.ai/api/v1",
                 model_kwargs={
                     "extra_headers": {
                         "HTTP-Referer": "https://streamlit-langchain-code-review.com",
@@ -392,8 +490,9 @@ class OpenRouterLangChainReviewer:
             # Test the model
             test_chain = self.llm | self.str_parser
             test_response = test_chain.invoke("Respond with 'Model ready' if you can analyze code.")
+            test_text = test_response.strip().lower() if isinstance(test_response, str) else str(test_response).strip().lower()
             
-            if len(test_response) > 5:
+            if "model ready" in test_text:
                 self.current_model = model_name
                 logger.info(f"Successfully configured {model_name} with Langsmith tracing")
                 return True
@@ -416,6 +515,12 @@ class OpenRouterLangChainReviewer:
         langsmith_client = get_langsmith_client()
         
         start_time = datetime.now()
+        try:
+            validated_language = _require_supported_language(language)
+        except ValueError as e:
+            logger.warning(f"Unsupported language '{language}': {e}")
+            raise
+        prompt_code = _prepare_code_for_prompt(code)
         
         try:
             # Check if code needs chunking
@@ -426,18 +531,17 @@ class OpenRouterLangChainReviewer:
             try:
                 # Debug: Log what we're sending to the model
                 logger.info(f"Sending to model - Language: {language}, Code length: {len(code)} chars")
-                logger.info(f"Code preview: {code[:200]}...")
 
                 # Create the analysis prompt dynamically to ensure proper variable substitution
                 analysis_prompt_text = f"""
-                You are a code security auditor. Analyze this {language} code VERY CAREFULLY for ANY issues.
+                You are a code security auditor. Analyze this {validated_language} code VERY CAREFULLY for ANY issues.
 
                 CODE TO ANALYZE:
-                ```{language}
-                {code}
+                ```{validated_language}
+                {prompt_code}
                 ```
 
-                You MUST return ONLY a valid JSON array. Find issues in this code!
+                You MUST return ONLY a valid JSON array. Find issues in this code if they exist.
 
                 REQUIRED JSON FORMAT:
                 [
@@ -465,7 +569,7 @@ class OpenRouterLangChainReviewer:
                 - Insecure default configurations
 
                 BE SPECIFIC: Reference actual line numbers and quote problematic code.
-                NEVER return empty array unless code is truly perfect.
+                Return [] if no issues found.
                 Your response must be ONLY the JSON array, nothing else.
                 """
 
@@ -486,35 +590,33 @@ class OpenRouterLangChainReviewer:
                     raw_result = str(raw_result)
 
                 # Enhanced JSON parsing with multiple fallback strategies
-                logger.info(f"Raw model response (first 500 chars): {raw_result[:500]}")
+                logger.info("Received model response")
                 result = self._parse_analysis_response(raw_result, code)
                 logger.info(f"Parsed result: {result}")
                         
-            except Exception as e:
+            except (ValueError, TypeError, json.JSONDecodeError) as e:
                 logger.warning(f"Chain execution failed: {e}")
+                result = []
+            except Exception as e:
+                logger.error(f"Unexpected error during chain execution: {e}")
                 result = []
             
             # Parse issues with error handling
             issues = []
+            code_lines = code.split('\n')
             if isinstance(result, list):
                 for issue_data in result:
-                    try:
-                        # Add code snippet if line number is valid
-                        if isinstance(issue_data, dict):
-                            line_num = issue_data.get('line_number', 0)
-                            if line_num > 0:
-                                code_lines = code.split('\n')
-                                if line_num <= len(code_lines):
-                                    issue_data['code_snippet'] = code_lines[line_num - 1].strip()
-                        
-                        issue = CodeIssue(**issue_data)
+                    issue = self._ensure_code_issue(issue_data, code_lines)
+                    if issue:
                         issues.append(issue)
-                    except Exception as e:
-                        logger.warning(f"Failed to parse issue: {e}")
-                        continue
+                    else:
+                        logger.warning("Skipping invalid issue data during parsing")
             elif isinstance(result, str):
                 # Handle case where result is still a string
                 issues = self._parse_text_to_issues(result, code)
+
+            # Normalize issues to avoid over-severity
+            issues = self._normalize_issues(issues, code)
 
             # If no issues found and we have code, try to detect obvious issues
             if not issues and code.strip():
@@ -557,14 +659,17 @@ class OpenRouterLangChainReviewer:
         # Ensure Langsmith is initialized
         langsmith_client = get_langsmith_client()
         
+        validated_language = _require_supported_language(language)
+        prompt_code = _prepare_code_for_prompt(code)
+
         try:
             # Create the security analysis prompt dynamically
             security_prompt_text = f"""
             You are a cybersecurity expert. Perform DEEP security analysis on this {language} code. Return ONLY valid JSON array.
 
             CODE TO ANALYZE:
-            ```{language}
-            {code}
+            ```{validated_language}
+            {prompt_code}
             ```
 
             You MUST return ONLY a valid JSON array. Find security vulnerabilities!
@@ -594,7 +699,7 @@ class OpenRouterLangChainReviewer:
 
             BE SPECIFIC: Include exact line numbers and quote problematic code.
             PRIORITIZE: Focus on high-impact security vulnerabilities.
-            NEVER return empty array unless code has NO security issues at all.
+            Return [] if no security issues are found.
             Your response must be ONLY the JSON array, nothing else.
             """
 
@@ -614,34 +719,17 @@ class OpenRouterLangChainReviewer:
             else:
                 raw_result = str(raw_result)
 
-            # Parse JSON from response
-            try:
-                import json
-                result = json.loads(raw_result)
-            except json.JSONDecodeError:
-                json_match = re.search(r'\[.*\]', raw_result, re.DOTALL)
-                if json_match:
-                    result = json.loads(json_match.group(0))
-                else:
-                    result = self._parse_text_to_issues(raw_result, code)
-            
+            parsed_result = self._parse_analysis_response(raw_result, code)
             issues = []
-            if isinstance(result, list):
-                for issue_data in result:
-                    try:
-                        if isinstance(issue_data, dict):
-                            line_num = issue_data.get('line_number', 0)
-                            if line_num > 0:
-                                code_lines = code.split('\n')
-                                if line_num <= len(code_lines):
-                                    issue_data['code_snippet'] = code_lines[line_num - 1].strip()
-                        
-                        issue = CodeIssue(**issue_data)
-                        if issue.category == IssueCategory.SECURITY:
-                            issues.append(issue)
-                    except Exception as e:
-                        logger.warning(f"Failed to parse security issue: {e}")
+            code_lines = code.split('\n')
+            for issue_data in parsed_result:
+                issue = self._ensure_code_issue(issue_data, code_lines)
+                if issue and issue.category == IssueCategory.SECURITY:
+                    issues.append(issue)
             
+            # Normalize issues to avoid over-severity
+            issues = self._normalize_issues(issues, code)
+
             # If no security issues found by AI, check for obvious security issues
             if not issues and code.strip():
                 logger.warning("No security issues found by AI, checking for obvious security issues")
@@ -665,14 +753,17 @@ class OpenRouterLangChainReviewer:
         # Ensure Langsmith is initialized
         langsmith_client = get_langsmith_client()
         
+        validated_language = _require_supported_language(language)
+        prompt_code = _prepare_code_for_prompt(code)
+
         try:
             # Create the performance analysis prompt dynamically
             performance_prompt_text = f"""
             You are a performance optimization expert. Analyze performance bottlenecks in this {language} code. Return ONLY valid JSON array.
 
             CODE TO ANALYZE:
-            ```{language}
-            {code}
+            ```{validated_language}
+            {prompt_code}
             ```
 
             You MUST return ONLY a valid JSON array. Find performance issues!
@@ -702,7 +793,7 @@ class OpenRouterLangChainReviewer:
             QUANTIFY IMPACT: Estimate performance improvement (e.g., "50% faster", "reduces memory by 60%").
             BE SPECIFIC: Include algorithmic complexity analysis and measurable improvements.
             PRIORITIZE: Focus on high-impact performance optimizations.
-            NEVER return empty array unless code has NO performance issues at all.
+            Return [] if no performance issues are found.
             Your response must be ONLY the JSON array, nothing else.
             """
 
@@ -722,34 +813,17 @@ class OpenRouterLangChainReviewer:
             else:
                 raw_result = str(raw_result)
 
-            # Parse JSON from response
-            try:
-                import json
-                result = json.loads(raw_result)
-            except json.JSONDecodeError:
-                json_match = re.search(r'\[.*\]', raw_result, re.DOTALL)
-                if json_match:
-                    result = json.loads(json_match.group(0))
-                else:
-                    result = self._parse_text_to_issues(raw_result, code)
-            
+            parsed_result = self._parse_analysis_response(raw_result, code)
             issues = []
-            if isinstance(result, list):
-                for issue_data in result:
-                    try:
-                        if isinstance(issue_data, dict):
-                            line_num = issue_data.get('line_number', 0)
-                            if line_num > 0:
-                                code_lines = code.split('\n')
-                                if line_num <= len(code_lines):
-                                    issue_data['code_snippet'] = code_lines[line_num - 1].strip()
-                        
-                        issue = CodeIssue(**issue_data)
-                        if issue.category == IssueCategory.PERFORMANCE:
-                            issues.append(issue)
-                    except Exception as e:
-                        logger.warning(f"Failed to parse performance issue: {e}")
+            code_lines = code.split('\n')
+            for issue_data in parsed_result:
+                issue = self._ensure_code_issue(issue_data, code_lines)
+                if issue and issue.category == IssueCategory.PERFORMANCE:
+                    issues.append(issue)
             
+            # Normalize issues to avoid over-severity
+            issues = self._normalize_issues(issues, code)
+
             # If no performance issues found by AI, check for obvious performance issues
             if not issues and code.strip():
                 logger.warning("No performance issues found by AI, checking for obvious performance issues")
@@ -771,6 +845,7 @@ class OpenRouterLangChainReviewer:
         langsmith_client = get_langsmith_client()
 
         start_time = datetime.now()
+        validated_language = _require_supported_language(language)
         
         # Split code into manageable chunks
         documents = [Document(page_content=code)]
@@ -785,12 +860,14 @@ class OpenRouterLangChainReviewer:
         for i, chunk in enumerate(chunks):
             try:
                 # Create the analysis prompt dynamically for this chunk
+                chunk_prompt_code = _prepare_code_for_prompt(chunk.page_content)
+
                 chunk_prompt_text = f"""
-                You are a code security auditor. Analyze this {language} code chunk VERY CAREFULLY for ANY issues.
+                You are a code security auditor. Analyze this {validated_language} code chunk VERY CAREFULLY for ANY issues.
 
                 CODE CHUNK TO ANALYZE:
-                ```{language}
-                {chunk.page_content}
+                ```{validated_language}
+                {chunk_prompt_code}
                 ```
 
                 You MUST return ONLY a valid JSON array. Find issues in this code chunk!
@@ -811,7 +888,7 @@ class OpenRouterLangChainReviewer:
                 If no issues found in this chunk, return: []
 
                 BE SPECIFIC: Reference actual line numbers and quote problematic code.
-                NEVER return empty array unless chunk has NO issues at all.
+                Return [] if no issues found in this chunk.
                 Your response must be ONLY the JSON array, nothing else.
                 """
 
@@ -831,31 +908,14 @@ class OpenRouterLangChainReviewer:
                 else:
                     raw_result = str(raw_result)
 
-                # Parse JSON from response
-                try:
-                    import json
-                    result = json.loads(raw_result)
-                except json.JSONDecodeError:
-                    json_match = re.search(r'\[.*\]', raw_result, re.DOTALL)
-                    if json_match:
-                        result = json.loads(json_match.group(0))
-                    else:
-                        result = self._parse_text_to_issues(raw_result, chunk.page_content)
+                parsed_result = self._parse_analysis_response(raw_result, chunk.page_content)
+                chunk_lines = chunk.page_content.split('\n')
 
-                if isinstance(result, list):
-                    for issue_data in result:
-                        try:
-                            if isinstance(issue_data, dict):
-                                line_num = issue_data.get('line_number', 0)
-                                if line_num > 0:
-                                    chunk_lines = chunk.page_content.split('\n')
-                                    if line_num <= len(chunk_lines):
-                                        issue_data['code_snippet'] = chunk_lines[line_num - 1].strip()
-                            
-                            issue = CodeIssue(**issue_data)
+                if isinstance(parsed_result, list):
+                    for issue_data in parsed_result:
+                        issue = self._ensure_code_issue(issue_data, chunk_lines)
+                        if issue:
                             all_issues.append(issue)
-                        except Exception as e:
-                            logger.warning(f"Failed to parse issue in chunk {i+1}: {e}")
                 
                 progress_bar.progress((i + 1) / len(chunks))
                 
@@ -865,6 +925,9 @@ class OpenRouterLangChainReviewer:
         
         progress_bar.empty()
         
+        # Normalize issues to avoid over-severity
+        all_issues = self._normalize_issues(all_issues, code)
+
         # Generate comprehensive summary
         summary = self._generate_summary(all_issues, code, language)
         quality_score = self._calculate_quality_score(all_issues, len(code.split('\n')))
@@ -1135,6 +1198,7 @@ class OpenRouterLangChainReviewer:
             r'(\[.*\])',                    # Just the JSON array
         ]
 
+        code_lines = code.split('\n')
         for pattern in json_patterns:
             matches = re.findall(pattern, text, re.DOTALL)
             if matches:
@@ -1143,20 +1207,9 @@ class OpenRouterLangChainReviewer:
                         result = json.loads(match)
                         if isinstance(result, list):
                             for issue_data in result:
-                                if isinstance(issue_data, dict):
-                                    try:
-                                        # Add code snippet if line number is valid
-                                        line_num = issue_data.get('line_number', 0)
-                                        if line_num > 0:
-                                            code_lines = code.split('\n')
-                                            if line_num <= len(code_lines):
-                                                issue_data['code_snippet'] = code_lines[line_num - 1].strip()
-
-                                        issue = CodeIssue(**issue_data)
-                                        issues.append(issue)
-                                    except Exception as e:
-                                        logger.warning(f"Failed to parse issue: {e}")
-                                        continue
+                                issue = self._ensure_code_issue(issue_data, code_lines)
+                                if issue:
+                                    issues.append(issue)
                     except json.JSONDecodeError:
                         continue
 
@@ -1246,78 +1299,151 @@ class OpenRouterLangChainReviewer:
         }
     
     def _parse_analysis_response(self, raw_result: str, code: str) -> List[dict]:
-        """Enhanced parsing of analysis response with multiple fallback strategies"""
+        """Enhanced parsing of analysis response with multiple fallback strategies and security validation"""
+        # SECURITY: Input validation and sanitization
+        if not isinstance(raw_result, str):
+            logger.warning("Non-string input received for JSON parsing")
+            return []
+
         # Clean the raw result first
         cleaned_result = raw_result.strip()
+
+        # SECURITY: Limit input size to prevent ReDoS attacks and resource exhaustion
+        max_parse_length = 50000  # Reasonable limit for JSON parsing
+        if len(cleaned_result) > max_parse_length:
+            logger.warning(f"Response too large for parsing ({len(cleaned_result)} chars), truncating")
+            cleaned_result = cleaned_result[:max_parse_length]
+
+        # SECURITY: Basic input sanitization - reject obviously malicious content
+        if any(malicious in cleaned_result.lower() for malicious in ['<script', 'javascript:', 'eval(', 'exec(', '__import__']):
+            logger.warning("Potentially malicious content detected in LLM response, rejecting")
+            return []
+
         logger.info(f"Parsing response: '{cleaned_result[:200]}...'")
 
-        # Strategy 1: Try direct JSON parsing
+        # Strategy 1: Try direct JSON parsing with security measures
         try:
+            # SECURITY: Use strict=False but with additional validation
             result = json.loads(cleaned_result)
             if isinstance(result, list):
-                logger.info(f"Strategy 1 success: Found {len(result)} issues")
-                return result
+                # SECURITY: Validate each issue object for expected structure
+                validated_result = []
+                for item in result:
+                    if isinstance(item, dict) and self._validate_issue_structure(item):
+                        validated_result.append(item)
+                    else:
+                        logger.warning("Invalid issue structure detected, skipping")
+                logger.info(f"Strategy 1 success: Found {len(validated_result)} valid issues")
+                return validated_result
         except json.JSONDecodeError as e:
             logger.info(f"Strategy 1 failed: {e}")
 
-        # Strategy 2: Extract JSON from code blocks
+        # Strategy 2: Extract JSON from code blocks with safer patterns
+        # Use more specific patterns to avoid ReDoS
         json_patterns = [
-            r'```json\s*(\[.*?\])\s*```',  # JSON in code blocks
-            r'```\s*(\[.*?\])\s*```',      # JSON in code blocks without json tag
-            r'```(\[.*?\])```',            # JSON in code blocks (alternative)
+            r'```json\s*(\[[\s\S]{0,10000}?\])\s*```',  # JSON in code blocks with size limit
+            r'```\s*(\[[\s\S]{0,10000}?\])\s*```',      # JSON in code blocks without json tag
+            r'```(\[[\s\S]{0,10000}?\])```',            # JSON in code blocks (alternative)
         ]
 
         for pattern in json_patterns:
-            matches = re.findall(pattern, cleaned_result, re.DOTALL)
-            logger.info(f"Strategy 2 pattern '{pattern}' found {len(matches)} matches")
-            for match in matches:
-                try:
-                    result = json.loads(match)
-                    if isinstance(result, list):
-                        logger.info(f"Strategy 2 success: Found {len(result)} issues")
-                        return result
-                except json.JSONDecodeError as e:
-                    logger.info(f"Strategy 2 JSON decode failed: {e}")
-                    continue
+            try:
+                matches = re.findall(pattern, cleaned_result, re.DOTALL)
+                logger.info(f"Strategy 2 pattern found {len(matches)} matches")
+                for match in matches:
+                    try:
+                        result = json.loads(match)
+                        if isinstance(result, list):
+                            logger.info(f"Strategy 2 success: Found {len(result)} issues")
+                            return result
+                    except json.JSONDecodeError as e:
+                        logger.info(f"Strategy 2 JSON decode failed: {e}")
+                        continue
+            except re.error as e:
+                logger.warning(f"Regex pattern failed: {e}")
+                continue
 
-        # Strategy 3: Extract any JSON array from the text
+        # Strategy 3: Extract any JSON array from the text with size limits
         json_array_patterns = [
-            r'(\[[\s\S]*?\])',  # Any JSON array (non-greedy)
+            r'(\[[\s\S]{0,10000}?\])',  # Any JSON array with size limit
         ]
 
         for pattern in json_array_patterns:
-            matches = re.findall(pattern, cleaned_result)
-            logger.info(f"Strategy 3 pattern found {len(matches)} matches")
-            for match in matches:
-                try:
-                    result = json.loads(match)
-                    if isinstance(result, list):
-                        logger.info(f"Strategy 3 success: Found {len(result)} issues")
-                        return result
-                except json.JSONDecodeError as e:
-                    logger.info(f"Strategy 3 JSON decode failed: {e}")
-                    continue
+            try:
+                matches = re.findall(pattern, cleaned_result)
+                logger.info(f"Strategy 3 pattern found {len(matches)} matches")
+                for match in matches:
+                    try:
+                        result = json.loads(match)
+                        if isinstance(result, list):
+                            logger.info(f"Strategy 3 success: Found {len(result)} issues")
+                            return result
+                    except json.JSONDecodeError as e:
+                        logger.info(f"Strategy 3 JSON decode failed: {e}")
+                        continue
+            except re.error as e:
+                logger.warning(f"Regex pattern failed: {e}")
+                continue
 
         # Strategy 4: Try to find structured content and parse as text
         logger.warning("All JSON parsing strategies failed, attempting text-based parsing")
         text_result = self._parse_text_to_issues(cleaned_result, code)
         logger.info(f"Text parsing result: {len(text_result)} issues")
         return text_result
-    
+
+    def _validate_issue_structure(self, issue_dict: dict) -> bool:
+        """Validate that an issue dictionary has the required structure"""
+        required_fields = ['severity', 'category', 'title', 'description']
+        return all(field in issue_dict for field in required_fields)
+
+    def _coerce_issue_category(self, category_value: Optional[Union[str, IssueCategory]]) -> IssueCategory:
+        """Coerce arbitrary category text into a valid IssueCategory."""
+        if isinstance(category_value, IssueCategory):
+            return category_value
+        if not category_value:
+            return IssueCategory.MAINTAINABILITY
+
+        normalized_value = str(category_value).strip().lower()
+        mapping = {
+            IssueCategory.SECURITY: ["security", "vulnerability", "auth", "authorization", "authentication", "cve", "secret", "token", "credential"],
+            IssueCategory.PERFORMANCE: ["performance", "speed", "latency", "resource", "optimization", "slow", "memory", "cpu", "throughput"],
+            IssueCategory.BUG: ["bug", "error", "crash", "failure", "exception", "issue", "error handling"],
+            IssueCategory.STYLE: ["style", "format", "naming", "convention", "lint", "code style", "formatting"],
+            IssueCategory.MAINTAINABILITY: ["maintainability", "code quality", "architecture", "refactor", "resource management", "readability"]
+        }
+
+        for category, keywords in mapping.items():
+            for keyword in keywords:
+                if keyword in normalized_value:
+                    return category
+
+        return IssueCategory.MAINTAINABILITY
+
     def _create_issue_from_dict(self, issue_dict: dict, code_lines: list) -> Optional[CodeIssue]:
-        """Create CodeIssue from dictionary with validation"""
+        """Create CodeIssue from dictionary with validation and normalized metadata."""
         try:
-            # Add code snippet if line number is valid
+            category_value = issue_dict.get('category')
+            issue_dict['category'] = self._coerce_issue_category(category_value)
+
             line_num = issue_dict.get('line_number', 0)
             if line_num > 0 and line_num <= len(code_lines):
                 issue_dict['code_snippet'] = code_lines[line_num - 1].strip()
             else:
-                issue_dict['code_snippet'] = ""
+                issue_dict['code_snippet'] = issue_dict.get('code_snippet', "")
             
             return CodeIssue(**issue_dict)
         except Exception as e:
             logger.warning(f"Failed to create issue: {e}")
             return None
+
+    def _ensure_code_issue(self, issue_data: Any, code_lines: List[str]) -> Optional[CodeIssue]:
+        """Return a CodeIssue regardless of whether we already have one or need to build from a dict."""
+        if isinstance(issue_data, CodeIssue):
+            return issue_data
+        if not isinstance(issue_data, dict):
+            return None
+
+        return self._create_issue_from_dict(issue_data, code_lines)
 
     def _generate_recommendations(self, issues: List[CodeIssue]) -> List[str]:
         """Generate prioritized recommendations based on issues"""
@@ -1513,6 +1639,9 @@ def main():
         page_icon="🔗",
         layout="wide"
     )
+
+    # Load .env so OPENROUTER_API_KEY can be picked up automatically
+    load_dotenv()
     
     st.title("🔗 LangChain Multi-Model Code Review")
     st.caption("**Powered by OpenRouter API** - Access 20+ AI models through LangChain")
@@ -1539,10 +1668,12 @@ def main():
         st.header("🔑 OpenRouter Configuration")
         
         # API Key input
+        api_key_env = os.getenv("OPENROUTER_API_KEY", "")
         api_key = st.text_input(
             "OpenRouter API Key",
             type="password",
-            help="Get your API key from https://openrouter.ai/keys"
+            value=api_key_env if api_key_env else "",
+            help="Loaded from .env (OPENROUTER_API_KEY) or enter it manually. Get it from https://openrouter.ai/keys"
         )
         
         if api_key:
@@ -1788,7 +1919,7 @@ def example_function():
             with st.spinner(f"🔍 Running {analysis_mode} with {reviewer.current_model}..."):
                 try:
                     # Update model temperature if changed
-                    if hasattr(reviewer.llm, 'temperature'):
+                    if reviewer.llm and hasattr(reviewer.llm, 'temperature'):
                         reviewer.llm.temperature = temperature
                     
                     # Run appropriate analysis
@@ -1828,26 +1959,29 @@ def example_function():
                             }
                         )
                     
-                    # Apply confidence filtering
+                    # Keep the full issue list for summary/export integrity
+                    full_issues = list(result.issues)
+
+                    # Apply confidence filtering for display only
+                    display_issues = full_issues
                     if confidence_threshold > 0:
-                        original_count = len(result.issues)
-                        result.issues = [i for i in result.issues if i.confidence >= confidence_threshold]
-                        filtered_count = len(result.issues)
-                        
-                        if filtered_count < original_count:
-                            st.info(f"🎯 Filtered {original_count - filtered_count} low-confidence issues (< {confidence_threshold})")
+                        display_issues = [i for i in display_issues if i.confidence >= confidence_threshold]
+                        filtered_count = len(display_issues)
+                        if filtered_count < len(full_issues):
+                            st.info(f"🎯 Filtered {len(full_issues) - filtered_count} low-confidence issues (< {confidence_threshold})")
                     
-                    # Limit display results
-                    if max_issues_display != "All" and len(result.issues) > int(max_issues_display):
-                        result.issues = result.issues[:int(max_issues_display)]
+                    # Limit display results only
+                    if max_issues_display != "All" and len(display_issues) > int(max_issues_display):
+                        display_issues = display_issues[:int(max_issues_display)]
                         st.info(f"📊 Showing top {max_issues_display} issues (use sidebar to show more)")
                     
                     st.session_state.analysis_results = result
+                    st.session_state.display_issues = display_issues
                     st.session_state.original_code = code_content
                     st.session_state.file_info = file_info
                     
                     # Success message with metrics
-                    success_msg = f"✅ **Analysis Complete!** Found {len(result.issues)} issues"
+                    success_msg = f"✅ **Analysis Complete!** Found {len(full_issues)} issues"
                     if result.token_usage.get('total_tokens'):
                         success_msg += f" • Used {result.token_usage['total_tokens']:,} tokens"
                     if result.token_usage.get('estimated_cost'):
@@ -1864,6 +1998,7 @@ def example_function():
         
         if st.session_state.analysis_results:
             result = st.session_state.analysis_results
+            display_issues = st.session_state.get("display_issues", result.issues)
             
             # Quality score with color coding
             quality_score = result.quality_score
@@ -1881,23 +2016,26 @@ def example_function():
 
             with col_metric1:
                 # Quality Score - BIG
-                st.markdown(f"<h1 style='text-align: center; color: #1f77b4;'>Quality Score</h1>", unsafe_allow_html=True)
-                st.markdown(f"<h1 style='text-align: center; font-size: 48px;'>{score_color} {quality_score:.1f}/100</h1>", unsafe_allow_html=True)
+                st.subheader("Quality Score")
+                st.metric("", f"{score_color} {quality_score:.1f}/100")
 
                 # Critical Issues - BIG
                 critical_count = len([i for i in result.issues if i.severity == Severity.CRITICAL])
-                st.markdown("<h2 style='text-align: center; color: #d62728;'>Critical Issues</h2>", unsafe_allow_html=True)
-                st.markdown(f"<h1 style='text-align: center; font-size: 42px; color: #d62728;'>{critical_count}</h1>", unsafe_allow_html=True)
+                st.subheader("Critical Issues")
+                st.metric("", critical_count)
 
             with col_metric2:
                 # High Priority - BIG
                 high_count = len([i for i in result.issues if i.severity == Severity.HIGH])
-                st.markdown("<h2 style='text-align: center; color: #ff7f0e;'>High Priority</h2>", unsafe_allow_html=True)
-                st.markdown(f"<h1 style='text-align: center; font-size: 42px; color: #ff7f0e;'>{high_count}</h1>", unsafe_allow_html=True)
+                st.subheader("High Priority")
+                st.metric("", high_count)
 
                 # Total Issues - BIG
-                st.markdown("<h2 style='text-align: center; color: #2ca02c;'>Total Issues</h2>", unsafe_allow_html=True)
-                st.markdown(f"<h1 style='text-align: center; font-size: 42px; color: #2ca02c;'>{len(result.issues)}</h1>", unsafe_allow_html=True)
+                st.subheader("Total Issues")
+                st.metric("", len(result.issues))
+
+            if len(display_issues) != len(result.issues):
+                st.info(f"🔎 Displaying {len(display_issues)} issues after filters")
 
             st.markdown("---")
 
@@ -1930,7 +2068,7 @@ def example_function():
                         st.markdown(rec)
             
             # Issues visualization
-            if result.issues:
+            if display_issues:
                 st.subheader("📊 Issues Breakdown")
                 
                 # Create severity and category charts
@@ -1938,7 +2076,7 @@ def example_function():
                 
                 with col_chart1:
                     severity_counts = {}
-                    for issue in result.issues:
+                    for issue in display_issues:
                         severity = issue.severity.value
                         severity_counts[severity] = severity_counts.get(severity, 0) + 1
                     
@@ -1952,7 +2090,7 @@ def example_function():
                 
                 with col_chart2:
                     category_counts = {}
-                    for issue in result.issues:
+                    for issue in display_issues:
                         category = issue.category.value
                         category_counts[category] = category_counts.get(category, 0) + 1
                     
@@ -1995,7 +2133,7 @@ def example_function():
     if st.session_state.analysis_results and st.session_state.analysis_results.issues:
         st.header("🔍 Detailed Issues Analysis")
         
-        issues = st.session_state.analysis_results.issues
+        issues = st.session_state.get("display_issues", st.session_state.analysis_results.issues)
         
         # Filtering options
         col_filter1, col_filter2, col_filter3 = st.columns(3)
@@ -2175,6 +2313,12 @@ Framework: LangChain + OpenRouter
                 st.info("🚧 Share functionality coming soon!")
                 st.write("For now, use the export options to share your analysis results.")
 
+    # Advanced features toggle
+    with st.sidebar:
+        st.divider()
+        if st.checkbox("🚀 Show Advanced Patterns", help="Display advanced LangChain usage examples"):
+            show_advanced_langchain_patterns()
+
 # Advanced features demonstration
 def show_advanced_langchain_patterns():
     """Demonstrate advanced LangChain patterns"""
@@ -2309,10 +2453,7 @@ performance_report = callback.get_performance_report()
         """, language="python")
 
 if __name__ == "__main__":
-    main()
-    
-    # Advanced features toggle
-    with st.sidebar:
-        st.divider()
-        if st.checkbox("🚀 Show Advanced Patterns", help="Display advanced LangChain usage examples"):
-            show_advanced_langchain_patterns()
+    if get_script_run_ctx() is None:
+        print("Run this app with: streamlit run Day_11/CodeReview.py")
+    else:
+        main()
