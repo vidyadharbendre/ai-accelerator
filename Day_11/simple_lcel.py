@@ -2,19 +2,27 @@
 # This tutorial demonstrates Simple Chain, Sequential Chain, and Simple Sequential Chain
 
 import os
+from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import PromptTemplate, ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
-from langchain.chains import LLMChain, SequentialChain, SimpleSequentialChain
+from langchain_core.runnables import RunnablePassthrough
 
-# Set your OpenAI API key
-# os.environ["OPENAI_API_KEY"] = "your-api-key-here"
+# OpenRouter setup (loaded from .env or environment)
+# Optional: set OPENROUTER_MODEL to override the default model.
+load_dotenv()
 
 # Initialize the LLM
 llm = ChatOpenAI(
-    model="gpt-3.5-turbo",
+    model=os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini"),
     temperature=0.7,
-    max_tokens=500
+    max_tokens=500,
+    base_url="https://openrouter.ai/api/v1",
+    api_key=os.getenv("OPENROUTER_API_KEY"),
+    default_headers={
+        "HTTP-Referer": "https://localhost",
+        "X-Title": "LangChain LCEL Tutorial"
+    }
 )
 
 print("🚀 LangChain Chain Types Tutorial")
@@ -32,14 +40,7 @@ story_prompt = ChatPromptTemplate.from_template(
 )
 
 # Create a simple chain: Prompt → LLM → Output Parser
-simple_chain = story_prompt | llm 
-
-
-# Create a simple LLMChain
-simple_chain = LLMChain(
-    llm=llm,
-    prompt=story_prompt,
-)
+simple_chain = story_prompt | llm | StrOutputParser()
 
 # Execute the simple chain
 topic = "a robot learning to paint"
@@ -67,18 +68,19 @@ slogan_prompt = ChatPromptTemplate.from_template(
 )
 slogan_chain = slogan_prompt | llm | StrOutputParser()
 
-# Create Simple Sequential Chain
-# Output from idea_chain automatically becomes input for slogan_chain
-simple_sequential_chain = SimpleSequentialChain(
-    chains=[idea_chain, slogan_chain],
-    verbose=True  # Shows intermediate outputs
+# Create Simple Sequential Chain using LCEL
+# Output from idea_chain becomes input for slogan_chain
+simple_sequential_chain = (
+    idea_chain
+    | (lambda business_idea: {"business_idea": business_idea})
+    | slogan_chain
 )
 
 # Execute the chain
 industry = "sustainable technology"
-final_result = simple_sequential_chain.invoke({"input": industry})
+final_result = simple_sequential_chain.invoke({"industry": industry})
 print(f"Industry: {industry}")
-print(f"Final Marketing Slogan: {final_result['output']}")
+print(f"Final Marketing Slogan: {final_result}")
 
 # ============================================================================
 # 3. SEQUENTIAL CHAIN (Multiple Inputs/Outputs with Named Variables)
@@ -97,11 +99,7 @@ analysis_prompt = PromptTemplate(
     Provide a brief market analysis (2-3 sentences).
     """
 )
-analysis_chain = LLMChain(
-    llm=llm,
-    prompt=analysis_prompt,
-    output_key="market_analysis"  # Named output
-)
+analysis_chain = analysis_prompt | llm | StrOutputParser()
 
 # Chain 2: Generate pricing strategy
 pricing_prompt = PromptTemplate(
@@ -113,11 +111,7 @@ pricing_prompt = PromptTemplate(
     Include price range and reasoning (2-3 sentences).
     """
 )
-pricing_chain = LLMChain(
-    llm=llm,
-    prompt=pricing_prompt,
-    output_key="pricing_strategy"  # Named output
-)
+pricing_chain = pricing_prompt | llm | StrOutputParser()
 
 # Chain 3: Create final business plan summary
 business_plan_prompt = PromptTemplate(
@@ -133,18 +127,13 @@ business_plan_prompt = PromptTemplate(
     Summarize in 3-4 sentences focusing on key opportunities.
     """
 )
-business_plan_chain = LLMChain(
-    llm=llm,
-    prompt=business_plan_prompt,
-    output_key="business_plan"  # Named output
-)
+business_plan_chain = business_plan_prompt | llm | StrOutputParser()
 
-# Create Sequential Chain with multiple named inputs/outputs
-sequential_chain = SequentialChain(
-    chains=[analysis_chain, pricing_chain, business_plan_chain],
-    input_variables=["product_name", "target_market"],  # Initial inputs
-    output_variables=["market_analysis", "pricing_strategy", "business_plan"],  # All outputs
-    verbose=True  # Shows all intermediate steps
+# Create Sequential Chain with multiple named inputs/outputs using LCEL
+sequential_chain = (
+    RunnablePassthrough.assign(market_analysis=analysis_chain)
+    .assign(pricing_strategy=pricing_chain)
+    .assign(business_plan=business_plan_chain)
 )
 
 # Execute the sequential chain
@@ -210,16 +199,19 @@ intro_writer = ChatPromptTemplate.from_template(
 ) | llm | StrOutputParser()
 
 # Create content pipeline
-content_pipeline = SimpleSequentialChain(
-    chains=[topic_generator, outline_generator, intro_writer],
-    verbose=True
+content_pipeline = (
+    topic_generator
+    | (lambda topics: {"topics": topics})
+    | outline_generator
+    | (lambda outline: {"outline": outline})
+    | intro_writer
 )
 
 # Execute content creation pipeline
 subject = "artificial intelligence in healthcare"
-content_result = content_pipeline.invoke({"input": subject})
+content_result = content_pipeline.invoke({"subject": subject})
 
 print(f"Subject: {subject}")
-print(f"Final Blog Introduction:\n{content_result['output']}")
+print(f"Final Blog Introduction:\n{content_result}")
 
 print("\n✅ Tutorial Complete! You've learned all three chain types in LangChain.")

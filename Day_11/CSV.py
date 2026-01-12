@@ -19,6 +19,7 @@ from typing import List, Optional
 import matplotlib.pyplot as plt
 import asyncio
 import json
+from io import BytesIO
 
 # Langsmith integration
 import langsmith
@@ -67,6 +68,24 @@ def home_page():
     1. Chat with CSV \n
     2. Analyze CSV  """)
 
+def format_openrouter_error(error_msg: str) -> str:
+    if "Key limit exceeded" in error_msg or "key limit exceeded" in error_msg:
+        return (
+            "❌ **OpenRouter key limit exceeded.** "
+            "Manage your keys at https://openrouter.ai/settings/keys and try again."
+        )
+    if "No endpoints found matching your data policy" in error_msg:
+        return (
+            "❌ **No endpoints match your OpenRouter data policy (Zero data retention).** "
+            "Update your privacy settings at https://openrouter.ai/settings/privacy and try again."
+        )
+    if "No endpoints found" in error_msg or "404" in error_msg:
+        return (
+            "❌ **Model unavailable on OpenRouter**. "
+            "Please pick a different model from the sidebar and try again."
+        )
+    return f"❌ Failed to connect to OpenRouter: {error_msg}"
+
 @st.cache_resource()
 def get_embeddings_model():
     """Initialize and cache the embedding model"""
@@ -79,9 +98,20 @@ def get_embeddings_model():
 # Remove caching from retriever_func to avoid API key issues
 def retriever_func(uploaded_file):
     if uploaded_file:
-        with tempfile.NamedTemporaryFile(delete=False) as tmp_file:
-            tmp_file.write(uploaded_file.getvalue())
-            tmp_file_path = tmp_file.name
+        csv_tmp_paths = []
+        file_name = uploaded_file.name if hasattr(uploaded_file, "name") else ""
+        is_xlsx = file_name.lower().endswith(".xlsx")
+        if is_xlsx:
+            df = pd.read_excel(uploaded_file)
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as tmp_file:
+                df.to_csv(tmp_file.name, index=False)
+                tmp_file_path = tmp_file.name
+                csv_tmp_paths.append(tmp_file_path)
+        else:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as tmp_file:
+                tmp_file.write(uploaded_file.getvalue())
+                tmp_file_path = tmp_file.name
+                csv_tmp_paths.append(tmp_file_path)
         try:
             loader = CSVLoader(file_path=tmp_file_path, encoding="utf-8")
             data = loader.load()
@@ -101,20 +131,21 @@ def retriever_func(uploaded_file):
         vectorstore = FAISS.from_documents(documents=all_splits, embedding=embeddings)
         retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": 6})
         
-        # Clean up temp file
-        os.remove(tmp_file_path)
+        # Clean up temp files
+        for path in csv_tmp_paths:
+            os.remove(path)
         return retriever, vectorstore
     else:
-        st.info("Please upload CSV documents to continue.")
+        st.info("Please upload a CSV or Excel document to continue.")
         st.stop()
 
 def chat(temperature, model_name, user_api_key):
     st.write("# Talk to CSV")
     reset = st.sidebar.button("Reset Chat")
-    uploaded_file = st.sidebar.file_uploader("Upload your CSV here 👇:", type="csv")
+    uploaded_file = st.sidebar.file_uploader("Upload your CSV or Excel file 👇:", type=["csv", "xlsx"])
 
     if not uploaded_file:
-        st.info("Please upload a CSV file to start chatting.")
+        st.info("Please upload a CSV or Excel file to start chatting.")
         return
 
     # Check if API key is valid
@@ -157,7 +188,7 @@ def chat(temperature, model_name, user_api_key):
             st.error("🔗 Visit: https://openrouter.ai/settings/credits")
             st.warning("💡 Try using a smaller model like 'mistralai/mistral-7b-instruct'")
         else:
-            st.error(f"❌ Failed to connect to OpenRouter: {error_msg}")
+            st.error(format_openrouter_error(error_msg))
         return
         
     if "messages" not in st.session_state:
@@ -261,18 +292,28 @@ def chat(temperature, model_name, user_api_key):
                             st.text(str(response))
 
                 except Exception as stream_error:
-                    st.error(f"❌ Response parsing error: {stream_error}")
-                    # Fallback to basic response
-                    try:
-                        response = with_message_history.invoke(
-                            {"context": context, "input": prompt},
-                            config={"configurable": {"session_id": "abc123"}}
+                    error_msg = str(stream_error)
+                    if "Key limit exceeded" in error_msg or "key limit exceeded" in error_msg:
+                        st.error(format_openrouter_error(error_msg))
+                        full_response = (
+                            "OpenRouter key limit exceeded. Please manage your keys at "
+                            "https://openrouter.ai/settings/keys and try again."
                         )
-                        full_response = response.content if hasattr(response, 'content') else str(response)
-                        message_placeholder.markdown(f"**Basic Response:**\n\n{full_response}")
-                    except Exception as fallback_error:
-                        st.error(f"❌ Complete failure: {fallback_error}")
-                        full_response = "Sorry, I encountered an error processing your request. Please try rephrasing your question."
+                        message_placeholder.markdown(full_response)
+                    else:
+                        st.error(f"❌ Response parsing error: {stream_error}")
+                        # Fallback to basic response
+                        try:
+                            response = with_message_history.invoke(
+                                {"context": context, "input": prompt},
+                                config={"configurable": {"session_id": "abc123"}}
+                            )
+                            full_response = response.content if hasattr(response, 'content') else str(response)
+                            message_placeholder.markdown(f"**Basic Response:**\n\n{full_response}")
+                        except Exception as fallback_error:
+                            st.error(format_openrouter_error(str(fallback_error)))
+                            st.error(f"❌ Complete failure: {fallback_error}")
+                            full_response = "Sorry, I encountered an error processing your request. Please try rephrasing your question."
 
                 st.session_state.messages.append({"role": "assistant", "content": full_response})
 
@@ -288,16 +329,27 @@ def chat(temperature, model_name, user_api_key):
 def summary(model_name, temperature, top_p, user_api_key):
     st.write("# Summary of CSV")
     st.write("Upload your document here:")
-    uploaded_file = st.file_uploader("Upload source document", type="csv", label_visibility="collapsed")
+    uploaded_file = st.file_uploader("Upload source document", type=["csv", "xlsx"], label_visibility="collapsed")
 
     if not user_api_key or user_api_key == "":
         st.error("❌ Please enter your OpenRouter API key in the sidebar to use this functionality.")
         return
 
     if uploaded_file is not None:
-        with tempfile.NamedTemporaryFile(delete=False) as tmp_file:
-            tmp_file.write(uploaded_file.getvalue())
-            tmp_file_path = tmp_file.name
+        csv_tmp_paths = []
+        file_name = uploaded_file.name if hasattr(uploaded_file, "name") else ""
+        is_xlsx = file_name.lower().endswith(".xlsx")
+        if is_xlsx:
+            df = pd.read_excel(uploaded_file)
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as tmp_file:
+                df.to_csv(tmp_file.name, index=False)
+                tmp_file_path = tmp_file.name
+                csv_tmp_paths.append(tmp_file_path)
+        else:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as tmp_file:
+                tmp_file.write(uploaded_file.getvalue())
+                tmp_file_path = tmp_file.name
+                csv_tmp_paths.append(tmp_file_path)
         
         text_splitter = RecursiveCharacterTextSplitter(chunk_size = 1024, chunk_overlap=100)
         try:
@@ -309,7 +361,8 @@ def summary(model_name, temperature, top_p, user_api_key):
             data = loader.load()
             texts = text_splitter.split_documents(data)
 
-        os.remove(tmp_file_path)
+        for path in csv_tmp_paths:
+            os.remove(path)
         
         st.info(f"📄 Loaded {len(texts)} text chunks from your CSV file")
         
@@ -344,27 +397,32 @@ def summary(model_name, temperature, top_p, user_api_key):
                     st.markdown("### 📋 Summary:")
                     st.write(result["output_text"])
                 except Exception as e:
-                    st.error(f"❌ Error generating summary: {str(e)}")
+                    st.error(format_openrouter_error(str(e)))
                     st.info("💡 Try using a smaller CSV file or check your API key.")
 
 def analyze(temperature, model_name, user_api_key):
     st.write("# Analyze CSV")
     reset = st.sidebar.button("Reset Chat")
-    uploaded_file = st.sidebar.file_uploader("Upload your CSV here 👇:", type="csv")
+    uploaded_file = st.sidebar.file_uploader("Upload your CSV or Excel file 👇:", type=["csv", "xlsx"])
 
     if not user_api_key or user_api_key == "":
         st.error("❌ Please enter your OpenRouter API key in the sidebar to use this functionality.")
         return
 
     if uploaded_file is not None:
-        with tempfile.NamedTemporaryFile(delete=False) as tmp_file:
-            tmp_file.write(uploaded_file.getvalue())
-            tmp_file_path = tmp_file.name
+        file_name = uploaded_file.name if hasattr(uploaded_file, "name") else ""
+        is_xlsx = file_name.lower().endswith(".xlsx")
+        if is_xlsx:
+            df = pd.read_excel(uploaded_file)
+        else:
+            try:
+                uploaded_file.seek(0)
+                df = pd.read_csv(uploaded_file, encoding="utf-8")
+            except Exception:
+                uploaded_file.seek(0)
+                df = pd.read_csv(BytesIO(uploaded_file.getvalue()), encoding="cp1252")
         
-        df = pd.read_csv(tmp_file_path)
-        os.remove(tmp_file_path)
-        
-        st.info(f"📊 CSV loaded: {df.shape[0]} rows × {df.shape[1]} columns")
+        st.info(f"📊 File loaded: {df.shape[0]} rows × {df.shape[1]} columns")
         
         with st.expander("📋 Column Information"):
             st.write("**Columns:**", list(df.columns))
@@ -388,7 +446,7 @@ def analyze(temperature, model_name, user_api_key):
             )
             st.success(f"🤖 Connected to {model_name} for analysis (max_tokens: {max_tokens})")
         except Exception as e:
-            st.error(f"❌ Failed to connect to OpenRouter: {str(e)}")
+            st.error(format_openrouter_error(str(e)))
             return
         
         try:
@@ -448,7 +506,7 @@ Important instructions for visualizations:
                 st.session_state.messages.append({"role": "assistant", "content": msg["output"]})
                 st.chat_message("assistant").write(msg["output"])
             except Exception as e:
-                error_msg = f"❌ Error: {str(e)}"
+                error_msg = format_openrouter_error(str(e))
                 st.session_state.messages.append({"role": "assistant", "content": error_msg})
                 st.chat_message("assistant").write(error_msg)
                 
@@ -506,7 +564,6 @@ def main():
 
     # OpenRouter model options
     MODEL_OPTIONS = [
-        "x-ai/grok-4-fast:free",
         "openai/gpt-4o",
         "openai/gpt-4o-mini",
         "openai/gpt-4-turbo",
@@ -516,7 +573,8 @@ def main():
         "meta-llama/llama-3.1-70b-instruct",
         "meta-llama/llama-3.1-8b-instruct",
         "google/gemini-pro-1.5-latest",
-        "mistralai/mistral-7b-instruct"
+        "mistralai/mistral-7b-instruct",
+        "x-ai/grok-4-fast-free"
     ]
     
     TEMPERATURE_MIN_VALUE = 0.0
@@ -527,7 +585,7 @@ def main():
     model_name = st.sidebar.selectbox(
         label="Model",
         options=MODEL_OPTIONS,
-        index=MODEL_OPTIONS.index("x-ai/grok-4-fast:free")  # Set Grok as default
+        index=MODEL_OPTIONS.index("openai/gpt-4o-mini")
     )
     top_p = st.sidebar.slider("Top_P", 0.0, 1.0, 1.0, 0.1)
     temperature = st.sidebar.slider(
@@ -543,7 +601,7 @@ def main():
         "- **OpenRouter API**: For chat models ([openrouter.ai](https://openrouter.ai))\n"
         "- **Embeddings**: Free HuggingFace model (no API key needed!)\n\n"
         "🚀 **Using**: `sentence-transformers/all-MiniLM-L6-v2`\n"
-        "🎯 **Free Model**: `x-ai/grok-4-fast:free` (default)"
+        "🎯 **Tip**: If a model errors, pick a different one from the sidebar."
     )
     
     st.sidebar.markdown("---")
